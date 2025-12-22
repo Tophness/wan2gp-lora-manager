@@ -3,21 +3,73 @@ import os
 import json
 import hashlib
 import urllib.request
+import requests
 import time
+import shutil
+import tempfile
+import cv2
+import base64
 from datetime import datetime
 from shared.utils.plugins import WAN2GPPlugin
+
+CIVITAI_HOST = "https://civitai.com"
+TRPC_URL = "https://civitai.com/api/trpc/model.getAll"
+REST_URL = "https://civitai.com/api/v1/models"
+IMAGE_BASE_URL = "https://imagecache.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+SORT_OPTIONS = ["Highest Rated", "Most Downloaded", "Newest", "Most Liked", "Most Discussed", "Most Collected"]
+PERIOD_OPTIONS = ["AllTime", "Year", "Month", "Week", "Day"]
+MODEL_TYPES = [
+    "Checkpoint", "LORA", "TextualInversion", "Hypernetwork", 
+    "AestheticGradient", "Controlnet", "Poses", "Wildcards", 
+    "Workflows", "MotionModule", "VAE", "Upscaler", "LoCon", "DoRA"
+]
+BASE_MODELS = [
+    "SD 1.4", "SD 1.5", "SD 1.5 LCM", "SD 1.5 Hyper", "SD 2.0", "SD 2.1",
+    "SDXL 1.0", "SDXL Lightning", "SDXL Hyper", "Pony", "Pony V7",
+    "Flux.1 S", "Flux.1 D", "Flux.1 Krea", "Flux.1 Kontext", "Flux.2 D",
+    "Wan Video 14B t2v", "Wan Video 14B i2v 720p", "Wan Video 14B i2v 480p",
+    "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 I2V-A14B", 
+    "Wan Video 2.5 T2V", "Wan Video 2.5 I2V",
+    "PixArt α", "PixArt Σ", "Hunyuan 1", "Hunyuan Video", "Lumina", "Kolors", "AuraFlow", "Mochi", "Z Image Turbo"
+]
+
+DEFAULT_BASE_SELECTION = [
+    "Wan Video 14B t2v", "Wan Video 14B i2v 720p", "Wan Video 14B i2v 480p",
+    "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 I2V-A14B", 
+    "Wan Video 2.5 T2V", "Wan Video 2.5 I2V"
+]
+
+PLACEHOLDER_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>"""
+PLACEHOLDER_B64 = f"data:image/svg+xml;base64,{base64.b64encode(PLACEHOLDER_SVG.encode('utf-8')).decode('utf-8')}"
 
 class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "1.1.0"
-        self.description = "Multi-LoRA management with rich CivitAI integration."
-        self.lora_root = "loras" 
-
+        self.version = "2.0.0"
+        self.description = "Manage local LoRAs and browse CivitAI."
+        
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self.lora_root = "loras" 
         self.db_path = os.path.join(self.plugin_dir, "lora_db.json")
+        self.settings_path = os.path.join(self.plugin_dir, "settings.json")
+        
+        self.previews_dir = os.path.abspath(os.path.join("icons", "lora_previews"))
+        os.makedirs(self.previews_dir, exist_ok=True)
+        
         self.lora_metadata = {}
+        self.saved_settings = {}
+
+        self.items_cache = []
+        self.cursor_cache = None
+
+        self.manager_to_browser_btn = None
+        self.manager_to_browser_state = None
+        self.civit_tabs = None
+
+        self.api_key = None
 
     def setup_ui(self):
         self.request_global("get_lora_dir")
@@ -29,9 +81,59 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.request_component("prompt") 
         self.request_component("loras_choices")
         self.request_component("main_tabs")
-
+        
         self.load_json_db()
+        self.load_settings()
+        
         self.on_tab_outputs = [] 
+
+        self.add_custom_js("""
+            window.civitSelectCard = function(id) {
+                const container = document.getElementById('civit_bridge_input');
+                if (!container) return;
+                const textarea = container.querySelector('textarea');
+                if (!textarea) return;
+                textarea.value = id;
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            window.triggerManagerToBrowser = function() {
+                const btn = document.getElementById('manager_to_browser_btn');
+                if (btn) btn.click();
+            }
+
+            window.toggleLoraCard = function(el, filename) {
+                el.classList.toggle('selected');
+
+                const bridge = document.getElementById('lora_selection_bridge');
+                if (!bridge) return console.error('Bridge not found');
+                const textarea = bridge.querySelector('textarea');
+                
+                let current = [];
+                try { current = JSON.parse(textarea.value || "[]"); } catch(e) {}
+                
+                if (current.includes(filename)) {
+                    current = current.filter(x => x !== filename);
+                } else {
+                    current.push(filename);
+                }
+                
+                textarea.value = JSON.stringify(current);
+                textarea.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            let civitScrollTimeout;
+            window.addEventListener('scroll', () => {
+                clearTimeout(civitScrollTimeout);
+                civitScrollTimeout = setTimeout(() => {
+                    const h = document.documentElement;
+                    if ((h.scrollTop + h.clientHeight) > (h.scrollHeight - 500)) {
+                        const btn = document.getElementById('civit_load_more_btn');
+                        if(btn) btn.click();
+                    }
+                }, 150);
+            });
+        """)
 
         self.add_tab(
             tab_id="lora_manager_tab",
@@ -40,29 +142,110 @@ class LoraManagerPlugin(WAN2GPPlugin):
             position=2
         )
 
+        self.add_tab(
+            tab_id="civitai_browser_tab",
+            label="CivitAI Browser",
+            component_constructor=self.create_browser_ui,
+            position=3
+        )
+
+    def load_settings(self):
+        if os.path.exists(self.settings_path):
+            try:
+                with open(self.settings_path, 'r', encoding='utf-8') as f:
+                    self.saved_settings = json.load(f)
+            except:
+                self.saved_settings = {}
+        else:
+            self.saved_settings = {}
+
+    def save_settings_to_disk(self, **kwargs):
+        for k, v in kwargs.items():
+            self.saved_settings[k] = v
+        try:
+            with open(self.settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self.saved_settings, f, indent=4)
+        except Exception as e: print(f"Error saving settings: {e}")
+
+
+    def get_headers(self, api_key: str = "") -> dict:
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            "Referer": "https://civitai.com/models"
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    def construct_media_url(self, uuid: str, width: int = 450, is_video: bool = False) -> str:
+        filename = "preview.mp4" if is_video else "preview.jpg"
+        return f"{IMAGE_BASE_URL}/{uuid}/width={width}/{filename}"
+
+    def get_local_preview_path(self, model_id):
+        if not model_id: return None, None
+        for ext in ['.jpg', '.png', '.mp4', '.webm']:
+            filename = f"{model_id}{ext}"
+            local_path = os.path.join(self.previews_dir, filename)
+            if os.path.exists(local_path):
+                return local_path, f"/gradio_api/file={local_path}"
+        return None, None
+
+    def download_preview_image(self, url, model_id):
+        if not url: return
+        mode = self.saved_settings.get("preview_mode", "Image Thumbnail (First Frame)")
+        
+        try:
+            is_video = url.endswith('.mp4') or url.endswith('.webm')
+            ext = os.path.splitext(url)[1] if is_video else '.jpg'
+
+            if is_video and mode == "Original Media (Video/Image)":
+                target = os.path.join(self.previews_dir, f"{model_id}{ext}")
+            else:
+                target = os.path.join(self.previews_dir, f"{model_id}.jpg")
+
+            r = requests.get(url, headers=self.get_headers(), stream=True)
+            if r.status_code != 200: return
+
+            if is_video:
+                if mode == "Original Media (Video/Image)":
+                    with open(target, 'wb') as f:
+                        shutil.copyfileobj(r.raw, f)
+                else:
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_vid:
+                        shutil.copyfileobj(r.raw, tmp_vid)
+                        tmp_vid_path = tmp_vid.name
+                    
+                    try:
+                        cap = cv2.VideoCapture(tmp_vid_path)
+                        ret, frame = cap.read()
+                        if ret: cv2.imwrite(target, frame)
+                        cap.release()
+                    except Exception as e: print(f"Frame extract error: {e}")
+                    finally:
+                        if os.path.exists(tmp_vid_path): os.remove(tmp_vid_path)
+            else:
+                with open(target, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+        except Exception as e: print(f"Preview download error: {e}")
+
+
     def generate_hash(self, file_path):
         hash_sha256 = hashlib.sha256()
         with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_sha256.update(chunk)
+            for chunk in iter(lambda: f.read(4096), b""): hash_sha256.update(chunk)
         return hash_sha256.hexdigest()
 
-    def fetch_civitai_data(self, file_path):
+    def fetch_civitai_data_by_hash(self, file_path):
         try:
             file_hash = self.generate_hash(file_path)
-            
             url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Wan2GP-Plugin'})
-            
-            with urllib.request.urlopen(req) as response:
-                data = json.loads(response.read().decode('utf-8'))
-            
-            if 'error' in data:
-                return None, f"CivitAI Error: {data.get('error')}"
-                
+            r = requests.get(url, headers=self.get_headers())
+            if r.status_code != 200: return None, f"HTTP Error: {r.status_code}"
+            data = r.json()
+            if 'error' in data: return None, f"CivitAI Error: {data.get('error')}"
             return data, None
-        except Exception as e:
-            return None, str(e)
+        except Exception as e: return None, str(e)
 
     def get_sidecar_json_path(self, lora_path):
         return os.path.splitext(lora_path)[0] + ".json"
@@ -72,61 +255,79 @@ class LoraManagerPlugin(WAN2GPPlugin):
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
             return dt.strftime("%Y-%m-%d")
-        except:
-            return date_str
+        except: return date_str
 
     def _fetch_and_process_single_lora(self, full_path, key):
-        data, err = self.fetch_civitai_data(full_path)
-        if err:
-            return False, err
+        data, err = self.fetch_civitai_data_by_hash(full_path)
+        if err: return False, err
 
         dest = self.get_sidecar_json_path(full_path)
         try:
-            with open(dest, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4)
-        except Exception as e:
-            return False, f"JSON save failed: {e}"
+            with open(dest, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
+        except Exception as e: return False, f"JSON save failed: {e}"
+
+        mid = data.get('modelId')
+        img_url = None
+        if 'images' in data and data['images']:
+            img_url = data['images'][0].get('url')
+        elif mid:
+             try:
+                 r = requests.get(f"{REST_URL}/{mid}", headers=self.get_headers())
+                 if r.status_code == 200:
+                     mdata = r.json()
+                     ver = next((v for v in mdata.get('modelVersions',[]) if v['id'] == data.get('id')), None)
+                     if ver and ver.get('images'): img_url = ver['images'][0]['url']
+                     elif mdata.get('modelVersions') and mdata['modelVersions'][0].get('images'):
+                         img_url = mdata['modelVersions'][0]['images'][0]['url']
+             except: pass
+        
+        if mid and img_url: self.download_preview_image(img_url, mid)
 
         trained_words = data.get('trainedWords', [])
         prompt_updated = False
-        
         current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
         
         if trained_words and not current_prompt:
             new_prompt = ", ".join(trained_words)
-            
-            if key not in self.lora_metadata:
-                self.lora_metadata[key] = {}
-            
+            if key not in self.lora_metadata: self.lora_metadata[key] = {}
             self.lora_metadata[key]["prompt"] = new_prompt
-            
             try:
-                with open(self.db_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.lora_metadata, f, indent=4)
+                with open(self.db_path, 'w', encoding='utf-8') as f: json.dump(self.lora_metadata, f, indent=4)
                 prompt_updated = True
-            except Exception as e:
-                return True, f"Metadata updated, but DB save failed: {e}"
+            except: pass
 
         msg = "Metadata updated."
-        if prompt_updated:
-            msg += " Default prompt set from triggers."
-            
+        if prompt_updated: msg += " Default prompt set from triggers."
         return True, msg
 
     def batch_update_metadata(self, state, category, current_files, progress=gr.Progress()):
-        if not current_files:
-            gr.Warning("No files to update.")
-            return gr.update(), gr.update()
-
         self.lora_root = self.discover_lora_root(state)
-        
+        files_to_process = []
+        if category == "All LoRAs":
+            for root, dirs, f_names in os.walk(self.lora_root):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                rel_root = os.path.relpath(root, self.lora_root)
+                if rel_root == ".": rel_root = ""
+                for f in f_names:
+                    if f.endswith(".safetensors") or f.endswith(".sft"):
+                        path = os.path.join(rel_root, f) if rel_root else f
+                        files_to_process.append(path)
+        else:
+            target_dir = os.path.join(self.lora_root, category)
+            if os.path.isdir(target_dir):
+                for f in os.listdir(target_dir):
+                    if f.endswith(".safetensors") or f.endswith(".sft"): files.append(f)
+
+        if not files_to_process:
+            gr.Warning("No files found to update.")
+            return 0
+
         updated_count = 0
         error_count = 0
         
-        for i, item_name in enumerate(progress.tqdm(current_files, desc="Updating Metadata")):
+        for i, item_name in enumerate(progress.tqdm(files_to_process, desc="Updating Metadata")):
             full_path = ""
             key = ""
-            
             if category == "All LoRAs":
                 full_path = os.path.join(self.lora_root, item_name)
                 key = item_name.replace("\\", "/")
@@ -136,490 +337,589 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
             if os.path.exists(full_path):
                 success, msg = self._fetch_and_process_single_lora(full_path, key)
-                if success:
-                    updated_count += 1
-                else:
-                    print(f"Failed to update {item_name}: {msg}")
-                    error_count += 1
+                if success: updated_count += 1
+                else: error_count += 1
+            time.sleep(0.1)
 
-            time.sleep(0.2)
-
-        gr.Info(f"Batch Update Complete. Updated: {updated_count}, Failed/Skipped: {error_count}")
-        return self.refresh_trigger.value + 1
+        gr.Info(f"Batch Update Complete. Updated: {updated_count}, Errors: {error_count}")
+        return (self.refresh_trigger.value or 0) + 1
 
     def create_manager_ui(self):
         self.is_initialized = gr.State(False)
         self.refresh_trigger = gr.State(0)
+        self.lora_selection_state = gr.State([])
+        
+        self.manager_to_browser_state = gr.State()
+        self.manager_to_browser_btn = gr.Button(visible=False, elem_id="manager_to_browser_btn")
+        self.lora_selection_bridge = gr.Textbox(elem_id="lora_selection_bridge", visible=False)
 
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### 📂 Library")
-                
-                self.category_dropdown = gr.Dropdown(
-                    label="Category",
-                    choices=[],
-                    value=None,
-                    interactive=True
-                )
-                
-                self.lora_list = gr.CheckboxGroup(
-                    choices=[],
-                    label="Available LoRAs",
-                    info="Select LoRAs to view details and inject.",
-                    interactive=True,
-                    elem_classes="lora-checkbox-list"
-                )
+                self.category_dropdown = gr.Dropdown(label="Category", choices=[], value=None, interactive=True)
+
+                self.lora_html_list = gr.HTML(elem_id="lora_html_list")
                 
                 with gr.Row():
-                    self.refresh_btn = gr.Button("🔄 Refresh List", size="sm")
-                    self.update_all_btn = gr.Button("🔄 Update All (Visible)", size="sm", variant="secondary")
+                    self.refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                    self.update_all_btn = gr.Button("🔄 Update Metadata", size="sm", variant="secondary")
 
-            with gr.Column(scale=2):
-
-                with gr.Group():
-                    gr.Markdown("### 🛠️ Settings")
+                with gr.Accordion("⚙️ Settings", open=False):
+                    self.api_key = gr.Textbox(
+                        label="CivitAI API Key", 
+                        type="password", 
+                        value=self.saved_settings.get("api_key", ""),
+                        info="Required for NSFW content and downloading certain models."
+                    )
                     self.auto_fetch_chk = gr.Checkbox(
-                        label="Auto-fetch metadata from CivitAI (if missing)",
-                        value=False,
-                        interactive=True
+                        label="Auto-fetch from CivitAI on select", 
+                        value=self.saved_settings.get("auto_fetch", False)
+                    )
+                    self.preview_mode = gr.Radio(
+                        label="Preview Download Mode",
+                        choices=["Image Thumbnail (First Frame)", "Original Media (Video/Image)"],
+                        value=self.saved_settings.get("preview_mode", "Image Thumbnail (First Frame)")
                     )
 
-                @gr.render(inputs=[self.lora_list, self.refresh_trigger, self.auto_fetch_chk], triggers=[self.lora_list.change, self.refresh_trigger.change])
-                def render_lora_cards(selected_items, _, auto_fetch):
+            with gr.Column(scale=2):
+                @gr.render(inputs=[self.lora_selection_state, self.refresh_trigger, self.auto_fetch_chk], triggers=[self.lora_selection_state.change, self.refresh_trigger.change])
+                def render_lora_details(selected_items, trig_val, auto_fetch):
                     if not selected_items:
-                        gr.Markdown("### 📝 Details")
-                        gr.Markdown("*Select a LoRA from the list on the left to view details and edit prompts.*")
+                        gr.Markdown("*Select a LoRA to view details.*")
                         return
 
-                    gr.Markdown(f"### 📝 Selected Details ({len(selected_items)})")
-                    
+                    gr.Markdown(f"### 📝 Details ({len(selected_items)} selected)")
+
                     for lora_name in selected_items:
                         key, full_path = self.resolve_path(lora_name)
                         current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
-
                         json_path = self.get_sidecar_json_path(full_path)
-                        civitai_data = None
-
+                        
                         if not os.path.exists(json_path) and auto_fetch:
-                            gr.Info(f"Auto-fetching metadata for {lora_name}...")
-                            success, msg = self._fetch_and_process_single_lora(full_path, key)
-                            if success:
-                                current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
-                            else:
-                                print(f"Auto-fetch warning: {msg}")
+                            self._fetch_and_process_single_lora(full_path, key)
+                            current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
 
+                        civitai_data = None
                         if os.path.exists(json_path):
                             try:
-                                with open(json_path, 'r', encoding='utf-8') as f:
-                                    civitai_data = json.load(f)
+                                with open(json_path, 'r', encoding='utf-8') as f: civitai_data = json.load(f)
                             except: pass
 
                         with gr.Group():
-                            with gr.Row(elem_classes="lora-card-header"):
-                                gr.Markdown(f"#### 🏷️ {os.path.basename(lora_name)}")
+                            with gr.Row():
+                                gr.Markdown(f"#### {os.path.basename(lora_name)}")
                             
-                            if "All LoRAs" in str(self.category_dropdown.value):
-                                gr.Markdown(f"*(Folder: {os.path.dirname(lora_name)})*")
-
                             if civitai_data:
+                                model_id = civitai_data.get('modelId')
+
                                 images_list = civitai_data.get('images', [])
                                 if images_list:
-                                    img_urls = [img.get('url') for img in images_list]
-                                    gr.Gallery(value=img_urls, label="Preview Images", columns=4, height=250, object_fit="contain")
+                                    img_urls = [img.get('url') for img in images_list[:4]]
+                                    gr.Gallery(value=img_urls, label="CivitAI Gallery", columns=4, height=200, object_fit="contain")
+                                else:
+                                    gr.Markdown("*No remote images found.*")
 
+                                model_name = civitai_data.get('model', {}).get('name', 'Unknown')
+                                base_model = civitai_data.get('baseModel', 'Unknown')
+                                gr.Markdown(f"**Model:** {model_name} | **Base:** {base_model}")
+                                
                                 with gr.Row():
-                                    model_name = civitai_data.get('model', {}).get('name', 'Unknown Model')
-                                    version_name = civitai_data.get('name', 'Unknown Version')
-                                    base_model = civitai_data.get('baseModel', 'Unknown Base')
+                                    if model_id:
+                                        view_btn = gr.Button("🔍 Browse on CivitAI", size="sm", variant="secondary")
+                                        view_btn.click(
+                                            fn=lambda m=model_id: m, 
+                                            inputs=None, 
+                                            outputs=[self.manager_to_browser_state]
+                                        ).then(
+                                            fn=None, 
+                                            js="window.triggerManagerToBrowser"
+                                        )
                                     
-                                    stats = civitai_data.get('stats', {})
-                                    downloads = stats.get('downloadCount', 0)
-                                    thumbs = stats.get('thumbsUpCount', 0)
-                                    nsfw_level = civitai_data.get('nsfwLevel', 'N/A')
-                                    
-                                    stats_md = f"""
-                                    **Model:** {model_name} ({version_name})  
-                                    **Base:** {base_model}  
-                                    **Downloads:** {downloads:,} | **👍** {thumbs:,} | **NSFW Level:** {nsfw_level}
-                                    """
-                                    gr.Markdown(stats_md)
+                                    upd_btn = gr.Button("🔄 Update Info", size="sm")
+                                    def do_upd(fp=full_path, k=key, cur_val=trig_val):
+                                        self._fetch_and_process_single_lora(fp, k)
+                                        return (cur_val or 0) + 1
+                                    upd_btn.click(fn=do_upd, inputs=None, outputs=[self.refresh_trigger])
 
-                                    with gr.Column(scale=0):
-                                        pub_date = self.format_date(civitai_data.get('publishedAt'))
-                                        upd_date = self.format_date(civitai_data.get('updatedAt'))
-                                        gr.Markdown(f"**Published:** {pub_date}\n**Updated:** {upd_date}")
-
-                                        model_id = civitai_data.get('modelId')
-                                        version_id = civitai_data.get('id')
-                                        if model_id and version_id:
-                                            link = f"https://civitai.com/models/{model_id}?modelVersionId={version_id}"
-                                            gr.Button("🔗 View on CivitAI", link=link, size="sm")
-
-                                        update_btn = gr.Button("🔄 Update Info", size="sm", variant="secondary")
-                                        def perform_update(fpath=full_path, k=key):
-                                            s, m = self._fetch_and_process_single_lora(fpath, k)
-                                            if s: gr.Info(m)
-                                            else: gr.Warning(m)
-                                            return 1
-                                        update_btn.click(fn=perform_update, inputs=None, outputs=[self.refresh_trigger])
-
-                                trained_words = civitai_data.get('trainedWords', [])
-                                if trained_words:
-                                    t_str = ", ".join(trained_words)
-                                    gr.Markdown(f"**Trigger Words:** `{t_str}`")
-
-                                desc_html = civitai_data.get('description', '')
-                                if desc_html:
-                                    with gr.Accordion("Description", open=False):
-                                        gr.HTML(desc_html)
+                                triggers = civitai_data.get('trainedWords', [])
+                                if triggers: gr.Markdown(f"**Triggers:** `{', '.join(triggers)}`")
 
                             else:
-                                with gr.Row():
-                                    gr.Markdown("*No metadata found locally.*")
-                                    fetch_btn = gr.Button("🌐 Fetch Info from CivitAI", size="sm", variant="secondary")
-                                    
-                                    def perform_manual_fetch(fpath=full_path, k=key):
-                                        s, m = self._fetch_and_process_single_lora(fpath, k)
-                                        if s: gr.Info(m)
-                                        else: gr.Warning(m)
-                                        return 1
-
-                                    fetch_btn.click(fn=perform_manual_fetch, inputs=None, outputs=[self.refresh_trigger])
+                                gr.Markdown("*No metadata found.*")
+                                man_fetch = gr.Button("🌐 Fetch Info", size="sm")
+                                def do_fetch(fp=full_path, k=key, cur_val=trig_val):
+                                    self._fetch_and_process_single_lora(fp, k)
+                                    return (cur_val or 0) + 1
+                                man_fetch.click(fn=do_fetch, inputs=None, outputs=[self.refresh_trigger])
 
                             key_state = gr.State(key)
-                            
-                            prompt_input = gr.TextArea(
-                                value=current_prompt,
-                                label="Default Trigger / Prompt",
-                                placeholder="Enter trigger words or prompt here...",
-                                lines=2,
-                                interactive=True
-                            )
-                            
-                            save_btn = gr.Button("💾 Save Prompt", size="sm", variant="secondary")
-
-                            save_btn.click(
-                                fn=self.save_metadata,
-                                inputs=[key_state, prompt_input],
-                                outputs=None
-                            )
+                            prompt_input = gr.TextArea(value=current_prompt, label="Trigger / Prompt", lines=2)
+                            save_btn = gr.Button("💾 Save Prompt", size="sm")
+                            save_btn.click(fn=self.save_metadata, inputs=[key_state, prompt_input], outputs=None)
                         gr.Markdown("---")
 
                 with gr.Column(visible=False) as self.actions_panel:
-                    gr.Markdown("### ⚙️ Injection Settings")
+                    gr.Markdown("### Inject to Generator")
                     with gr.Row():
-                        self.prompt_mode = gr.Radio(
-                            choices=["Append", "Overwrite"],
-                            value="Append",
-                            label="Prompt Mode",
-                            interactive=True
-                        )
-                        self.lora_mode = gr.Radio(
-                            choices=["Append", "Overwrite"],
-                            value="Append",
-                            label="LoRA List Mode",
-                            interactive=True
-                        )
-                    
+                        self.prompt_mode = gr.Radio(["Append", "Overwrite"], value="Append", label="Prompt Mode")
+                        self.lora_mode = gr.Radio(["Append", "Overwrite"], value="Append", label="List Mode")
                     self.use_btn = gr.Button("✨ Send to Generator", variant="primary")
 
-                    with gr.Column(visible=False) as self.conflict_panel:
-                        gr.Markdown("---")
-                        gr.Markdown("#### ⚠️ Conflict Resolution")
-                        gr.Markdown("Multiple prompts detected. How should they be handled?")
-                        self.prompt_choice = gr.Radio(
-                            choices=[],
-                            label="Choose Strategy",
-                            interactive=True
-                        )
-                        with gr.Row():
-                            self.confirm_inject_btn = gr.Button("Confirm", variant="stop")
-                            self.cancel_inject_btn = gr.Button("Cancel", variant="secondary")
-
-        self.on_tab_outputs = [self.is_initialized, self.category_dropdown, self.lora_list]
-
-        def toggle_actions(selected):
-            return gr.update(visible=bool(selected))
-
-        def reset_conflict_panel():
-            return gr.update(visible=False), gr.update(value=None)
-
-        self.lora_list.change(
-            fn=toggle_actions,
-            inputs=[self.lora_list],
-            outputs=[self.actions_panel]
-        ).then(
-            fn=reset_conflict_panel,
-            inputs=None,
-            outputs=[self.conflict_panel, self.prompt_choice]
-        )
+        self.on_tab_outputs = [self.is_initialized, self.category_dropdown, self.lora_html_list]
 
         self.category_dropdown.change(
-            fn=self.update_list_by_category,
-            inputs=[self.category_dropdown],
-            outputs=[self.lora_list]
+            self.render_lora_grid, 
+            [self.state, self.category_dropdown, self.lora_selection_state], 
+            [self.lora_html_list]
         )
-
+        
         self.refresh_btn.click(
-            fn=self.force_refresh,
-            inputs=[self.state, self.category_dropdown],
-            outputs=[self.category_dropdown, self.lora_list]
+            self.ui_refresh_click, 
+            [self.state, self.category_dropdown, self.lora_selection_state], 
+            [self.category_dropdown, self.lora_html_list]
+        )
+        
+        self.update_all_btn.click(self.batch_update_metadata, [self.state, self.category_dropdown, self.lora_selection_state], [self.refresh_trigger])
+
+        self.api_key.change(
+            lambda x: self.save_settings_to_disk(api_key=x), inputs=[self.api_key], outputs=None
+        )
+        self.auto_fetch_chk.change(
+            lambda x: self.save_settings_to_disk(auto_fetch=x), inputs=[self.auto_fetch_chk], outputs=None
+        )
+        self.preview_mode.change(
+            lambda x: self.save_settings_to_disk(preview_mode=x), inputs=[self.preview_mode], outputs=None
         )
 
-        self.update_all_btn.click(
-            fn=self.batch_update_metadata,
-            inputs=[self.state, self.category_dropdown, self.lora_list],
-            outputs=[self.refresh_trigger]
-        )
+        self.lora_selection_bridge.change(fn=lambda x: json.loads(x) if x else [], inputs=[self.lora_selection_bridge], outputs=[self.lora_selection_state])
+        self.lora_selection_state.change(lambda x: gr.update(visible=bool(x)), self.lora_selection_state, self.actions_panel)
+        self.use_btn.click(self.finalize_injection, [self.lora_selection_state, self.prompt_mode, self.lora_mode, self.prompt, self.loras_choices], [self.prompt, self.loras_choices, self.main_tabs])
 
-        self.use_btn.click(
-            fn=self.prepare_injection,
-            inputs=[self.lora_list, self.prompt_mode, self.lora_mode],
-            outputs=[self.conflict_panel, self.prompt_choice, self.prompt, self.loras_choices, self.main_tabs]
-        )
+    def create_browser_ui(self):
+        self.civit_items = gr.State([])
+        self.civit_cursor = gr.State(None)
+        self.civit_model_data = gr.State({})
 
-        self.confirm_inject_btn.click(
-            fn=self.finalize_injection,
-            inputs=[self.lora_list, self.prompt_choice, self.prompt_mode, self.lora_mode, self.prompt, self.loras_choices],
-            outputs=[self.prompt, self.loras_choices, self.main_tabs, self.conflict_panel]
-        )
+        self.bridge_input = gr.Textbox(elem_id="civit_bridge_input", visible=False)
+        self.load_more_btn = gr.Button("Load More", elem_id="civit_load_more_btn", visible=False)
+        self.browser_bridge_trigger = gr.Button(visible=False) 
 
-        self.cancel_inject_btn.click(
-            fn=reset_conflict_panel,
-            inputs=None,
-            outputs=[self.conflict_panel, self.prompt_choice]
-        )
+        d_sort = self.saved_settings.get("sort", "Highest Rated")
+        d_period = self.saved_settings.get("period", "Week")
+        d_nsfw = self.saved_settings.get("nsfw", True)
+        d_types = self.saved_settings.get("types", ["Checkpoint", "LORA"])
+        d_base = self.saved_settings.get("base", DEFAULT_BASE_SELECTION)
+
+        with gr.Tabs() as self.civit_tabs:
+            with gr.Tab("Browse", id="browse_tab"):
+                with gr.Row():
+                    with gr.Column(scale=1, min_width=250):
+                        self.query = gr.Textbox(label="Search", placeholder="Search models...")
+                        with gr.Accordion("Filters", open=True):
+                            self.sort = gr.Dropdown(SORT_OPTIONS, value=d_sort, label="Sort")
+                            self.period = gr.Dropdown(PERIOD_OPTIONS, value=d_period, label="Period")
+                            self.nsfw = gr.Checkbox(label="NSFW", value=d_nsfw)
+                            self.types = gr.Dropdown(MODEL_TYPES, value=d_types, multiselect=True, label="Types")
+                            self.base = gr.Dropdown(BASE_MODELS, value=d_base, multiselect=True, label="Base Models")
+                        self.search_btn = gr.Button("Search / Browse", variant="primary")
+                        self.status = gr.Markdown("Ready")
+                    with gr.Column(scale=3):
+                        self.html_results = gr.HTML()
+
+            with gr.Tab("Details", id="details_tab"):
+                self.back_btn = gr.Button("← Back to Browse")
+                self.detail_header = gr.HTML()
+                with gr.Row():
+                    self.ver_dd = gr.Dropdown(label="Version", interactive=True)
+                    self.file_dd = gr.Dropdown(label="File", interactive=True)
+                    self.dl_btn = gr.Button("Download to Wan2GP", variant="primary")
+                self.dl_status = gr.Textbox(label="Download Status", interactive=False)
+                self.media_area = gr.HTML()
+
+        self.manager_to_browser_btn.click(self.bridge_manager_to_browser, inputs=[self.manager_to_browser_state], outputs=[self.main_tabs, self.bridge_input, self.browser_bridge_trigger])
+
+        def save_browser_settings(sort, period, nsfw, types, base):
+            self.save_settings_to_disk(sort=sort, period=period, nsfw=nsfw, types=types, base=base)
+        
+        save_inputs = [self.sort, self.period, self.nsfw, self.types, self.base]
+        for comp in save_inputs:
+            comp.change(save_browser_settings, inputs=save_inputs, outputs=None)
+
+        self.search_btn.click(self.run_search, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key], [self.html_results, self.civit_items, self.civit_cursor, self.status])
+        self.load_more_btn.click(self.run_more, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key, self.civit_cursor, self.civit_items], [self.html_results, self.civit_items, self.civit_cursor, self.status])
+        self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area])
+        self.ver_dd.change(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area])
+        self.back_btn.click(lambda: gr.Tabs(selected="browse_tab"), None, self.civit_tabs)
+        self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data], [self.dl_status])
+        self.search_btn.click()
+
+    def render_lora_grid(self, state, category, selected_list):
+        self.lora_root = self.discover_lora_root(state)
+        files = []
+        
+        if category == "All LoRAs":
+            for root, dirs, f_names in os.walk(self.lora_root):
+                dirs[:] = [d for d in dirs if not d.startswith('.')]
+                rel_root = os.path.relpath(root, self.lora_root)
+                if rel_root == ".": rel_root = ""
+                for f in f_names:
+                    if f.endswith(".safetensors") or f.endswith(".sft"):
+                        files.append(os.path.join(rel_root, f) if rel_root else f)
+        elif category and os.path.isdir(os.path.join(self.lora_root, category)):
+            target_dir = os.path.join(self.lora_root, category)
+            for f in os.listdir(target_dir):
+                if f.endswith(".safetensors") or f.endswith(".sft"):
+                    files.append(f)
+        
+        files.sort()
+        
+        html = """
+        <style>
+            .lora-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; max-height: 600px; overflow-y: auto; padding: 4px; }
+            .lora-item { 
+                background: #252630; 
+                border-radius: 6px; 
+                overflow: hidden; 
+                border: 2px solid transparent; 
+                cursor: pointer; 
+                position: relative; 
+                transition: all 0.2s; 
+                aspect-ratio: 1; 
+            }
+            .lora-item:hover { border-color: #4dabf7; }
+            .lora-item.selected { border-color: #4dabf7; box-shadow: 0 0 0 2px rgba(77, 171, 247, 0.4); }
+            
+            .lora-thumb { width: 100%; height: 100%; object-fit: cover; background: #111; display: block; }
+            
+            .lora-name { 
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                width: 100%;
+                background: rgba(0, 0, 0, 0.7);
+                color: white !important;
+                padding: 4px 6px;
+                font-size: 11px;
+                line-height: 1.2;
+                font-weight: 600;
+                text-shadow: none;
+                z-index: 5;
+                box-sizing: border-box;
+                word-break: break-all;
+                pointer-events: none;
+                -webkit-font-smoothing: antialiased;
+            }
+            
+            .lora-check { 
+                position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; 
+                border-radius: 50%; background: #4dabf7; display: none; 
+                align-items: center; justify-content: center; color: white; 
+                font-size: 12px; font-weight: bold; z-index: 10; 
+                box-shadow: 0 2px 4px rgba(0,0,0,0.3); 
+            }
+            .lora-item.selected .lora-check { display: flex; }
+        </style>
+        <div class="lora-grid">
+        """
+        
+        for f in files:
+            full_path = os.path.join(self.lora_root, f if category == "All LoRAs" else os.path.join(category, f))
+            json_path = self.get_sidecar_json_path(full_path)
+            
+            model_id = None
+            if os.path.exists(json_path):
+                try:
+                    with open(json_path) as jf:
+                        d = json.load(jf)
+                        model_id = d.get('modelId')
+                except: pass
+            
+            _, img_path = self.get_local_preview_path(model_id)
+            
+            is_video = img_path and (img_path.endswith('.mp4') or img_path.endswith('.webm'))
+            img_content = ""
+            
+            if img_path:
+                if is_video:
+                    img_content = f'<video src="{img_path}" class="lora-thumb" autoplay loop muted playsinline></video>'
+                else:
+                    img_content = f'<img src="{img_path}" class="lora-thumb" loading="lazy">'
+            else:
+                img_content = f'<img src="{PLACEHOLDER_B64}" class="lora-thumb" loading="lazy">'
+            
+            is_sel = f in selected_list
+            sel_class = "selected" if is_sel else ""
+            f_esc = f.replace("'", "\\'")
+            
+            html += f"""
+            <div class="lora-item {sel_class}" onclick="toggleLoraCard(this, '{f_esc}')">
+                <div class="lora-check">✓</div>
+                {img_content}
+                <div class="lora-name">{os.path.basename(f)}</div>
+            </div>
+            """
+            
+        html += "</div>"
+        return html
+
+    
+    def ui_refresh_click(self, state, sel, selected_list):
+        _, dd, html = self.force_refresh(state, sel, selected_list)
+        return dd, html
+
+    def force_refresh(self, state, sel, selected_list=None):
+        self.lora_root = self.discover_lora_root(state)
+        dmap = self.build_category_map()
+        folders = []
+        if os.path.isdir(self.lora_root):
+            for d in sorted([x for x in os.listdir(self.lora_root) if os.path.isdir(os.path.join(self.lora_root, x)) and not x.startswith('.')]):
+                folders.append((dmap.get(d, d), d))
+        choices = [("All LoRAs", "All LoRAs")] + folders
+        val = sel if sel and sel in [c[1] for c in choices] else "All LoRAs"
+        if val == "All LoRAs":
+            try:
+                td = self.get_lora_dir(self.get_state_model_type(state))
+                tf = os.path.basename(td)
+                if tf in [c[1] for c in choices]: val = tf
+            except: pass
+        
+        return True, gr.update(choices=choices, value=val), self.render_lora_grid(state, val, selected_list or [])
+
+    def run_search(self, q, s, p, t, b, n, k):
+        items, nxt, msg = self.router_search(q, s, p, t, b, n, k, None)
+        self.items_cache = items 
+        html = self.render_html_grid(items)
+        return html, items, nxt, msg
+
+    def run_more(self, q, s, p, t, b, n, k, cur, existing):
+        if not cur: return gr.update(), existing, cur, "No more pages"
+        new_items, nxt, msg = self.router_search(q, s, p, t, b, n, k, cur)
+        combined = existing + new_items
+        self.items_cache = combined
+        html = self.render_html_grid(combined)
+        return html, combined, nxt, msg
+
+    def router_search(self, query, sort, period, types, base, nsfw, key, cursor):
+        if query and query.strip(): return self.search_rest(query, sort, period, nsfw, key, cursor)
+        else: return self.browse_trpc(sort, period, types, base, nsfw, key, cursor)
+
+    def search_rest(self, query, sort, period, nsfw, key, cursor):
+        params = {"query": query, "limit": 20, "sort": sort, "period": period, "nsfw": "true" if nsfw else "false"}
+        if cursor: params["cursor"] = cursor
+        try:
+            r = requests.get(REST_URL, headers=self.get_headers(key), params=params)
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("items", [])
+            meta = data.get("metadata", {})
+            next_cursor = meta.get("nextCursor") 
+            if not next_cursor and meta.get("nextPage") and "cursor=" in meta["nextPage"]:
+                try: next_cursor = meta["nextPage"].split("cursor=")[1].split("&")[0]
+                except: pass
+            return items, next_cursor, f"Search: {len(items)} results"
+        except Exception as e: return [], None, f"Error: {e}"
+
+    def browse_trpc(self, sort, period, types, base_models, nsfw, key, cursor):
+        input_obj = {"json": {"period": period, "periodMode": "published", "sort": sort, "types": types if types else MODEL_TYPES, "baseModels": base_models if base_models else [], "browsingLevel": 31 if nsfw else 1, "cursor": cursor, "authed": bool(key)}, "meta": {"values": {"cursor": ["undefined"]}}}
+        try:
+            r = requests.get(TRPC_URL, headers=self.get_headers(key), params={"input": json.dumps(input_obj)})
+            r.raise_for_status()
+            data = r.json()
+            json_data = data.get("result", {}).get("data", {}).get("json", {})
+            return json_data.get("items", []), json_data.get("nextCursor"), f"Browse: {len(json_data.get('items', []))} items"
+        except Exception as e: return [], None, f"Error: {e}"
+
+    def render_html_grid(self, items):
+        if not items: return "<div style='color:#888; padding:20px; text-align:center;'>No models found.</div>"
+        html = """<style>.civit-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; font-family: sans-serif; } .civit-card { background: #252630; border-radius: 8px; overflow: hidden; position: relative; padding-top: 150%; cursor: pointer; border: 1px solid #373a40; transition: transform 0.2s; } .civit-card:hover { transform: translateY(-4px); border-color: #4dabf7; box-shadow: 0 4px 15px rgba(0,0,0,0.3); } .civit-media-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #101113; } .civit-media { width: 100%; height: 100%; object-fit: cover; display: block; } .civit-overlay { position: absolute; bottom: 0; left: 0; right: 0; background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 50%, transparent 100%); padding: 40px 8px 8px; pointer-events: none; } .civit-title { color: #ffffff !important; font-weight: 700; font-size: 0.95rem; text-shadow: 0 2px 4px rgba(0,0,0,0.8); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.2; margin-bottom: 4px; } .civit-badge { background: rgba(34,139,230,0.9); color: #ffffff !important; padding: 2px 5px; border-radius: 4px; font-size: 0.75rem; display: inline-block; font-weight: 600; text-shadow: none; } .civit-stats { color: #e0e0e0 !important; font-size: 0.8rem; margin-top: 2px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); } </style><div class="civit-grid">"""
+        for item in items:
+            mid = item.get('id')
+            name = item.get('name', 'Unknown').replace('"', '&quot;')
+            mtype = item.get('type', 'Model')
+            rank = item.get('rank', {}) or {}
+            stats = item.get('stats', {}) or {}
+            thumbs = rank.get('thumbsUpCount', stats.get('favoriteCount', stats.get('thumbsUpCount', 0))) or 0
+            dls = rank.get('downloadCount', stats.get('downloadCount', 0)) or 0
+            dls_str = f"{dls/1000:.1f}k" if dls > 1000 else str(dls)
+            
+            _, local_url = self.get_local_preview_path(mid)
+            media_html = f'<img class="civit-media" src="{local_url}" loading="lazy">' if local_url else self._render_remote_media(item)
+            
+            html += f"""<div class="civit-card" onclick="window.civitSelectCard({mid})"><div class="civit-media-container">{media_html}</div><div class="civit-overlay"><div class="civit-title">{name}</div><div><span class="civit-badge">{mtype}</span> <span class="civit-stats">👍 {thumbs} · ⬇ {dls_str}</span></div></div></div>"""
+        html += "</div>"
+        return html
+
+    def _render_remote_media(self, item):
+        imgs = item.get('images', [])
+        if not imgs and 'modelVersions' in item and item['modelVersions']: imgs = item['modelVersions'][0].get('images', [])
+        if imgs:
+            first = imgs[0]
+            url = first.get('url')
+            is_vid = first.get('type') == 'video' or (url and url.endswith(('.mp4','.webm')))
+            src = self.construct_media_url(url, 450, is_vid) if url and "http" not in url else url
+            if is_vid:
+                poster = self.construct_media_url(url, 450, False) if url and "http" not in url else ""
+                return f'<video class="civit-media" src="{src}" poster="{poster}" autoplay loop muted playsinline></video>'
+            else:
+                return f'<img class="civit-media" src="{src}" loading="lazy">'
+        return '<div class="civit-media" style="display:flex;align-items:center;justify-content:center;color:#666;">No Preview</div>'
+
+    def on_select_model(self, model_id_str, current_items, api_key):
+        if not model_id_str: return gr.update(), "", gr.update(), {}, "Ready"
+        try: mid = int(model_id_str)
+        except: return gr.update(), "", gr.update(), {}, "Invalid ID"
+        preview = next((x for x in (current_items or []) if x.get('id') == mid), {})
+        full_data = preview
+        try:
+            r = requests.get(f"{REST_URL}/{mid}", headers=self.get_headers(api_key))
+            if r.status_code == 200: full_data = r.json()
+        except: pass
+        
+        name = full_data.get('name', 'Unknown')
+        creator = full_data.get('creator', {}).get('username', 'Unknown')
+        desc = full_data.get('description', 'No description.')
+        tags = ", ".join(full_data.get('tags', []))
+        
+        html = f"""<style>.civit-details-box {{ background-color: #1f2937; color: #ffffff !important; padding: 25px; border-radius: 12px; border: 1px solid #374151; font-family: sans-serif; }} .civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; border-bottom: 1px solid #374151; padding-bottom: 15px; margin-bottom: 20px; }} .civit-details-box p, .civit-details-box li, .civit-details-box span, .civit-details-box div {{ color: #d1d5db !important; line-height: 1.6; }} .civit-details-box a {{ color: #60a5fa !important; text-decoration: none; font-weight: 500; }} .civit-details-box a:hover {{ text-decoration: underline; }} .civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }} .civit-badge-prop {{ background-color: #374151 !important; color: #ffffff !important; padding: 6px 12px; border-radius: 6px; display: inline-block; font-size: 0.9em; margin-right: 10px; margin-bottom: 10px; border: 1px solid #4b5563; font-weight: 500; }}</style><div class="civit-details-box"><h1>{name}</h1><div style="margin-bottom: 20px;"><span class="civit-badge-prop">👤 <b>{creator}</b></span><span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span><span class="civit-badge-prop">🏷 {tags}</span></div><div>{desc}</div></div>"""
+        
+        versions = full_data.get('modelVersions', [])
+        if not versions and 'version' in full_data: versions = [full_data['version']]
+        ver_choices = [(f"{v['name']} ({v.get('baseModel','?')})", v['id']) for v in versions]
+        first_ver = ver_choices[0][1] if ver_choices else None
+        
+        return gr.Tabs(selected="details_tab"), html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}"
+
+    def update_version_files(self, version_id, model_data):
+        if not model_data or not version_id: return gr.update(choices=[]), ""
+        versions = model_data.get('modelVersions', [])
+        if not versions and 'version' in model_data: versions = [model_data['version']]
+        version = next((v for v in versions if v['id'] == version_id), None)
+        if not version: return gr.update(choices=[]), "Version info missing"
+        
+        file_opts = []
+        for f in version.get('files', []):
+            label = f"{f.get('type','Model')} | {f['name']} | {round(f.get('sizeKB',0)/1024, 2)} MB"
+            file_opts.append((label, f['downloadUrl']))
+        
+        media_html = "<div style='display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:15px;'>"
+        for img in version.get('images', []):
+            url = img.get('url')
+            if not url: continue
+            is_vid = img.get('type') == 'video' or url.endswith(('.mp4','.webm'))
+            src = self.construct_media_url(url, 450, is_vid) if url and "http" not in url else url
+            if is_vid:
+                poster = self.construct_media_url(url, 450, False) if url and "http" not in url else ""
+                media_html += f"""
+                <div style='background:#111; border-radius:8px; overflow:hidden; border: 1px solid #333; aspect-ratio:2/3;'>
+                    <video src='{src}' poster='{poster}' loop muted playsinline controls 
+                           onmouseover="this.play()" onmouseout="this.pause()" 
+                           style='width:100%;height:100%;object-fit:contain;display:block;'>
+                    </video>
+                </div>"""
+            else:
+                media_html += f"<div style='background:#111; border-radius:8px; overflow:hidden; border: 1px solid #333; aspect-ratio:2/3;'><img src='{src}' loading='lazy' style='width:100%;height:100%;object-fit:contain;display:block;'></div>"
+        media_html += "</div>"
+        
+        return gr.update(choices=file_opts, value=file_opts[0][1] if file_opts else None), media_html
+
+    def download_model(self, url, key, state, model_data):
+        if not url: return "No file selected"
+        target_dir = self.discover_lora_root(state)
+        if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
+        try:
+            r = requests.get(url, headers=self.get_headers(key), stream=True)
+            r.raise_for_status()
+            fname = "model.safetensors"
+            if "content-disposition" in r.headers and "filename=" in r.headers["content-disposition"]:
+                fname = r.headers["content-disposition"].split("filename=")[1].strip('"').strip(';')
+            save_path = os.path.join(target_dir, fname)
+            with open(save_path, 'wb') as f:
+                for chunk in r.iter_content(1024*1024): f.write(chunk)
+
+            mid = model_data.get('id')
+            if mid:
+                self._fetch_and_process_single_lora(save_path, fname)
+                _, local_prev = self.get_local_preview_path(mid)
+                if not local_prev and model_data.get('images'): self.download_preview_image(model_data['images'][0]['url'], mid)
+            
+            return f"Saved to {fname}"
+        except Exception as e: return f"Error: {e}"
+
+    def bridge_manager_to_browser(self, mid):
+        if not mid: return gr.update(), gr.update(), gr.update()
+        return gr.Tabs(selected="plugin_civitai_browser_tab"), str(mid), None
 
     def on_tab_select(self, state):
-        return self.handle_tab_load(state)
-
-    def handle_tab_load(self, state):
-        if getattr(self, 'has_loaded_once', False):
-            return gr.update(), gr.update(), gr.update()
-        
+        if getattr(self, 'has_loaded_once', False): return gr.update(), gr.update(), gr.update()
         self.has_loaded_once = True
-        is_init, dd_update, list_update = self.force_refresh(state, None)
-        return is_init, dd_update, list_update
+        return self.force_refresh(state, None, None)
 
     def load_json_db(self):
         if os.path.exists(self.db_path):
             try:
-                with open(self.db_path, 'r', encoding='utf-8') as f:
-                    self.lora_metadata = json.load(f)
-            except:
-                self.lora_metadata = {}
-        else:
-            self.lora_metadata = {}
+                with open(self.db_path, 'r') as f: self.lora_metadata = json.load(f)
+            except: self.lora_metadata = {}
+        else: self.lora_metadata = {}
 
     def resolve_path(self, item_name):
         is_recursive = os.path.sep in item_name or "/" in item_name
-        
-        if is_recursive:
-            full_path = os.path.join(self.lora_root, item_name)
-            key = item_name
-        else:
-            full_path = ""
-            key = ""
-            for root, _, files in os.walk(self.lora_root):
-                if item_name in files:
-                    full_path = os.path.join(root, item_name)
-                    key = os.path.join(os.path.relpath(root, self.lora_root), item_name)
-                    break
-        
-        key = key.replace("\\", "/") 
-        return key, full_path
+        if is_recursive: return item_name.replace("\\", "/"), os.path.join(self.lora_root, item_name)
+        for root, _, files in os.walk(self.lora_root):
+            if item_name in files:
+                return os.path.join(os.path.relpath(root, self.lora_root), item_name).replace("\\", "/"), os.path.join(root, item_name)
+        return item_name, ""
 
     def save_metadata(self, key, prompt):
         if not key: return
-        key = key.replace("\\", "/") 
-        
         if key not in self.lora_metadata: self.lora_metadata[key] = {}
         self.lora_metadata[key]["prompt"] = prompt
-        
         try:
-            with open(self.db_path, 'w', encoding='utf-8') as f:
-                json.dump(self.lora_metadata, f, indent=4)
-            gr.Info(f"Saved prompt!")
-        except Exception as e:
-            gr.Error(f"Save error: {e}")
+            with open(self.db_path, 'w') as f: json.dump(self.lora_metadata, f, indent=4)
+            gr.Info("Saved!")
+        except Exception as e: gr.Error(f"Error: {e}")
 
     def discover_lora_root(self, state):
-        model_type = self.get_state_model_type(state)
-        try:
-            specific_dir = self.get_lora_dir(model_type)
-            if specific_dir and os.path.isdir(specific_dir):
-                return os.path.dirname(specific_dir)
-        except:
-            pass
+        try: 
+            d = self.get_lora_dir(self.get_state_model_type(state))
+            if d and os.path.isdir(d): return os.path.dirname(d)
+        except: pass
         return "loras"
 
     def build_category_map(self):
         folder_to_models = {}
-        
         if hasattr(self, 'model_types') and self.model_types:
             for mtype in self.model_types:
                 try:
                     path = self.get_lora_dir(mtype)
                     if path:
                         folder = os.path.basename(path)
-                        dummy_list = [""]
-                        pretty_name = self.get_model_name(mtype, dummy_list)
-                        
-                        if folder not in folder_to_models:
-                            folder_to_models[folder] = []
-                        
-                        if pretty_name not in folder_to_models[folder]:
-                            folder_to_models[folder].append(pretty_name)
-                except:
-                    continue
-        
-        display_map = {}
-        for folder, models in folder_to_models.items():
-            if not models:
-                display_map[folder] = folder
+                        dummy = [""]
+                        pname = self.get_model_name(mtype, dummy)
+                        if folder not in folder_to_models: folder_to_models[folder] = []
+                        if pname not in folder_to_models[folder]: folder_to_models[folder].append(pname)
+                except: continue
+        dmap = {}
+        for f, ms in folder_to_models.items():
+            if not ms: dmap[f] = f
             else:
-                model_str = ", ".join(models[:2])
-                if len(models) > 2: model_str += ", ..."
-                display_map[folder] = f"{folder} ({model_str})"
-        
-        return display_map
+                mstr = ", ".join(ms[:2]) + (", ..." if len(ms)>2 else "")
+                dmap[f] = f"{f} ({mstr})"
+        return dmap
 
-    def force_refresh(self, state, current_selection):
-        self.lora_root = self.discover_lora_root(state)
-        display_map = self.build_category_map()
-        
-        folder_choices = [] 
-        if os.path.isdir(self.lora_root):
-            subdirs = [
-                d for d in os.listdir(self.lora_root) 
-                if os.path.isdir(os.path.join(self.lora_root, d)) 
-                and not d.startswith('.') and not d.startswith('__')
-            ]
-            
-            for d in sorted(subdirs):
-                label = display_map.get(d, d)
-                folder_choices.append((label, d))
-        
-        choices = [("All LoRAs", "All LoRAs")] + folder_choices
-        
-        selected_val = current_selection
-        valid_values = [c[1] for c in choices]
-        
-        if not selected_val or selected_val not in valid_values:
-            current_model_type = self.get_state_model_type(state)
-            try:
-                target_dir = self.get_lora_dir(current_model_type)
-                target_folder = os.path.basename(target_dir)
-                
-                if target_folder in valid_values:
-                    selected_val = target_folder
-                else:
-                    selected_val = "All LoRAs"
-            except:
-                selected_val = "All LoRAs"
-
-        list_update = self.update_list_by_category(selected_val)
-        return True, gr.update(choices=choices, value=selected_val), list_update
-
-    def update_list_by_category(self, category):
-        files = []
-        if not category or not os.path.isdir(self.lora_root):
-            return gr.update(choices=[])
-
-        if category == "All LoRAs":
-            for root, dirs, f_names in os.walk(self.lora_root):
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
-                rel_root = os.path.relpath(root, self.lora_root)
-                if rel_root == ".": rel_root = ""
-                
-                for f in f_names:
-                    if f.endswith(".safetensors") or f.endswith(".sft"):
-                        if rel_root:
-                            files.append(os.path.join(rel_root, f))
-                        else:
-                            files.append(f)
-        else:
-            target_dir = os.path.join(self.lora_root, category)
-            if os.path.isdir(target_dir):
-                for f in os.listdir(target_dir):
-                    if f.endswith(".safetensors") or f.endswith(".sft"):
-                        files.append(f)
-        
-        files.sort()
-        return gr.update(choices=files, label=f"Files in {category}")
-
-    def prepare_injection(self, selected_loras, prompt_mode, lora_mode):
-        if not selected_loras:
-            gr.Warning("No LoRAs selected.")
-            return gr.update(visible=False), gr.update(), gr.update(), gr.update(), gr.update()
-
+    def finalize_injection(self, selected_loras, prompt_mode, lora_mode, current_prompt, current_loras):
         prompts = []
         for l in selected_loras:
-            key, _ = self.resolve_path(l)
-            p = self.lora_metadata.get(key, {}).get("prompt", "")
-            if p: prompts.append((os.path.basename(l), p))
-
-        if len(selected_loras) == 1:
-            p_text = prompts[0][1] if prompts else ""
-            new_prompt, new_choices, tab_upd = self._perform_inject(selected_loras, p_text, prompt_mode, lora_mode)
-            return gr.update(visible=False), gr.update(), new_prompt, new_choices, tab_upd
-
-        if not prompts:
-             new_prompt, new_choices, tab_upd = self._perform_inject(selected_loras, "", prompt_mode, lora_mode)
-             return gr.update(visible=False), gr.update(), new_prompt, new_choices, tab_upd
-
-        choices = []
-        combined = []
-        for name, p in prompts:
-            choices.append((f"Use {name} prompt only", p))
-            if p: combined.append(p)
+            k, _ = self.resolve_path(l)
+            p = self.lora_metadata.get(k, {}).get("prompt", "")
+            if p: prompts.append(p)
         
-        combined_str = ", ".join(combined)
-        if combined_str:
-            choices.append(("Combine All Prompts", combined_str))
+        p_text = ", ".join(prompts)
+        new_prompt = p_text if prompt_mode == "Overwrite" else (f"{current_prompt}\n{p_text}" if current_prompt and p_text else (current_prompt or p_text))
         
-        choices.append(("Don't add prompt (LoRAs only)", ""))
-        
-        return (
-            gr.update(visible=True),
-            gr.update(choices=choices, value=combined_str if combined_str else ""),
-            gr.update(), gr.update(), gr.update()
-        )
-
-    def finalize_injection(self, selected_loras, prompt_choice, prompt_mode, lora_mode, current_prompt, current_loras):
-        new_prompt, new_choices, tab_update = self._perform_inject(
-            selected_loras, 
-            prompt_choice, 
-            prompt_mode,
-            lora_mode,
-            current_prompt,
-            current_loras
-        )
-        return new_prompt, new_choices, tab_update, gr.update(visible=False)
-
-    def _perform_inject(self, selected_loras_list, prompt_text, prompt_mode, lora_mode, current_ui_prompt="", current_ui_loras=None):
-        if prompt_mode == "Overwrite":
-            new_prompt = prompt_text
-        else:
-            new_prompt = current_ui_prompt or ""
-            if prompt_text:
-                if new_prompt:
-                    new_prompt += "\n" + prompt_text
-                else:
-                    new_prompt = prompt_text
-
-        if current_ui_loras is None: current_ui_loras = []
-        if not isinstance(current_ui_loras, list): current_ui_loras = []
-        
-        if lora_mode == "Overwrite":
-            final_loras = []
-        else:
-            final_loras = current_ui_loras.copy()
-        
-        for l in selected_loras_list:
-            base = os.path.basename(l)
-            if base not in final_loras:
-                final_loras.append(base)
-
-        gr.Info(f"Injected {len(selected_loras_list)} LoRAs")
-        return new_prompt, final_loras, gr.Tabs(selected="video_gen")
+        final_loras = [] if lora_mode == "Overwrite" else (current_loras or []).copy()
+        for l in selected_loras:
+            b = os.path.basename(l)
+            if b not in final_loras: final_loras.append(b)
+            
+        gr.Info(f"Injected {len(selected_loras)} LoRAs")
+        return new_prompt, final_loras, self.goto_video_tab(None)
