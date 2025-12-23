@@ -48,7 +48,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.0.0"
+        self.version = "2.0.1"
         self.description = "Manage local LoRAs and browse CivitAI."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -730,44 +730,160 @@ class LoraManagerPlugin(WAN2GPPlugin):
         except Exception as e: return [], None, f"Error: {e}"
 
     def render_html_grid(self, items):
-        if not items: return "<div style='color:#888; padding:20px; text-align:center;'>No models found.</div>"
-        html = """<style>.civit-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; font-family: sans-serif; } .civit-card { background: #252630; border-radius: 8px; overflow: hidden; position: relative; padding-top: 150%; cursor: pointer; border: 1px solid #373a40; transition: transform 0.2s; } .civit-card:hover { transform: translateY(-4px); border-color: #4dabf7; box-shadow: 0 4px 15px rgba(0,0,0,0.3); } .civit-media-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: #101113; } .civit-media { width: 100%; height: 100%; object-fit: cover; display: block; } .civit-overlay { position: absolute; bottom: 0; left: 0; right: 0; background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 50%, transparent 100%); padding: 40px 8px 8px; pointer-events: none; } .civit-title { color: #ffffff !important; font-weight: 700; font-size: 0.95rem; text-shadow: 0 2px 4px rgba(0,0,0,0.8); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.2; margin-bottom: 4px; } .civit-badge { background: rgba(34,139,230,0.9); color: #ffffff !important; padding: 2px 5px; border-radius: 4px; font-size: 0.75rem; display: inline-block; font-weight: 600; text-shadow: none; } .civit-stats { color: #e0e0e0 !important; font-size: 0.8rem; margin-top: 2px; text-shadow: 0 1px 2px rgba(0,0,0,0.8); } </style><div class="civit-grid">"""
+        if not items:
+            return "<div style='color:#888; padding:20px; text-align:center; font-size:1.2em;'>No models found.</div>"
+
+        html = """
+        <style>
+            .civit-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+                gap: 16px;
+                padding: 10px;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }
+            .civit-card {
+                background-color: #252630;
+                border-radius: 12px;
+                overflow: hidden;
+                position: relative;
+                padding-top: 150%; 
+                cursor: pointer;
+                border: 1px solid #373a40;
+                transition: transform 0.2s;
+                box-sizing: border-box;
+            }
+            .civit-card:hover {
+                transform: translateY(-4px);
+                border-color: #4dabf7;
+                box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+            }
+            .civit-media-container {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 100%;
+                height: 100%;
+                background: #101113;
+                z-index: 1;
+            }
+            .civit-media {
+                width: 100% !important;
+                height: 100% !important;
+                object-fit: cover !important;
+                display: block;
+            }
+            .civit-overlay {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 60%, transparent 100%);
+                padding: 50px 12px 12px 12px;
+                pointer-events: none;
+                z-index: 2;
+            }
+            .civit-title {
+                color: #ffffff !important;
+                font-weight: 700;
+                font-size: 1rem;
+                line-height: 1.3;
+                text-shadow: 0 2px 3px rgba(0,0,0,1);
+                margin-bottom: 6px;
+                display: -webkit-box;
+                -webkit-line-clamp: 3;
+                -webkit-box-orient: vertical;
+                overflow: hidden;
+            }
+            .civit-meta {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                font-size: 0.8rem;
+            }
+            .civit-badge {
+                background: rgba(34, 139, 230, 0.9);
+                color: #fff;
+                padding: 3px 6px;
+                border-radius: 4px;
+                font-size: 0.75rem;
+                font-weight: 500;
+            }
+        </style>
+        <div class="civit-grid">
+        """
+
         for item in items:
             mid = item.get('id')
             name = item.get('name', 'Unknown').replace('"', '&quot;')
-            mtype = item.get('type', 'Model')
+            
             rank = item.get('rank', {}) or {}
             stats = item.get('stats', {}) or {}
             thumbs = rank.get('thumbsUpCount', stats.get('favoriteCount', stats.get('thumbsUpCount', 0))) or 0
             dls = rank.get('downloadCount', stats.get('downloadCount', 0)) or 0
             dls_str = f"{dls/1000:.1f}k" if dls > 1000 else str(dls)
             
-            _, local_url = self.get_local_preview_path(mid)
-            media_html = f'<img class="civit-media" src="{local_url}" loading="lazy">' if local_url else self._render_remote_media(item)
+            mtype = item.get('type', 'Model')
+
+            media_html = ""
+            poster_src = ""
             
-            html += f"""<div class="civit-card" onclick="window.civitSelectCard({mid})"><div class="civit-media-container">{media_html}</div><div class="civit-overlay"><div class="civit-title">{name}</div><div><span class="civit-badge">{mtype}</span> <span class="civit-stats">👍 {thumbs} · ⬇ {dls_str}</span></div></div></div>"""
+            imgs = item.get('images', [])
+            if not imgs and 'version' in item: imgs = item['version'].get('images', [])
+            if not imgs and 'modelVersions' in item and item['modelVersions']: imgs = item['modelVersions'][0].get('images', [])
+
+            if imgs:
+                first = imgs[0]
+                url = first.get('url')
+                is_vid = first.get('type') == 'video' or (url and (url.endswith('.mp4') or url.endswith('.webm')))
+                
+                src = ""
+                if url:
+                    if "http" not in url:
+                        src = self.construct_media_url(url, 450, is_vid)
+                        if is_vid:
+                            poster_src = self.construct_media_url(url, 450, False)
+                    else:
+                        src = url
+                        if is_vid:
+                            poster_src = src.replace('.mp4', '.jpg').replace('.webm', '.jpg')
+
+                if is_vid:
+                    media_html = f'<video class="civit-media" src="{src}" poster="{poster_src}" autoplay loop muted playsinline preload="auto"></video>'
+                else:
+                    _, local_url = self.get_local_preview_path(mid)
+                    if local_url:
+                        media_html = f'<img class="civit-media" src="{local_url}" loading="lazy" alt="preview">'
+                    else:
+                        media_html = f'<img class="civit-media" src="{src}" loading="lazy" alt="preview">'
+            else:
+                media_html = '<div class="civit-media" style="display:flex;align-items:center;justify-content:center;color:#666;background:#222;">No Preview</div>'
+
+            html += f"""
+            <div class="civit-card" onclick="window.civitSelectCard({mid})">
+                <div class="civit-media-container">{media_html}</div>
+                <div class="civit-overlay">
+                    <div class="civit-title">{name}</div>
+                    <div class="civit-meta">
+                        <span class="civit-badge">{mtype}</span>
+                        <span style="color: #ffffff; text-shadow: 0 1px 3px rgba(0,0,0,1); font-weight: 600;">👍 {thumbs} · ⬇ {dls_str}</span>
+                    </div>
+                </div>
+            </div>
+            """
+
         html += "</div>"
         return html
 
-    def _render_remote_media(self, item):
-        imgs = item.get('images', [])
-        if not imgs and 'modelVersions' in item and item['modelVersions']: imgs = item['modelVersions'][0].get('images', [])
-        if imgs:
-            first = imgs[0]
-            url = first.get('url')
-            is_vid = first.get('type') == 'video' or (url and url.endswith(('.mp4','.webm')))
-            src = self.construct_media_url(url, 450, is_vid) if url and "http" not in url else url
-            if is_vid:
-                poster = self.construct_media_url(url, 450, False) if url and "http" not in url else ""
-                return f'<video class="civit-media" src="{src}" poster="{poster}" autoplay loop muted playsinline></video>'
-            else:
-                return f'<img class="civit-media" src="{src}" loading="lazy">'
-        return '<div class="civit-media" style="display:flex;align-items:center;justify-content:center;color:#666;">No Preview</div>'
-
     def on_select_model(self, model_id_str, current_items, api_key):
-        if not model_id_str: return gr.update(), "", gr.update(), {}, "Ready"
-        try: mid = int(model_id_str)
-        except: return gr.update(), "", gr.update(), {}, "Invalid ID"
+        if not model_id_str:
+            return gr.update(), "", gr.update(), {}, "Ready"
+        
+        try:
+            mid = int(model_id_str)
+        except:
+            return gr.update(), "", gr.update(), {}, "Invalid ID"
+
         preview = next((x for x in (current_items or []) if x.get('id') == mid), {})
         full_data = preview
         try:
@@ -780,14 +896,65 @@ class LoraManagerPlugin(WAN2GPPlugin):
         desc = full_data.get('description', 'No description.')
         tags = ", ".join(full_data.get('tags', []))
         
-        html = f"""<style>.civit-details-box {{ background-color: #1f2937; color: #ffffff !important; padding: 25px; border-radius: 12px; border: 1px solid #374151; font-family: sans-serif; }} .civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; border-bottom: 1px solid #374151; padding-bottom: 15px; margin-bottom: 20px; }} .civit-details-box p, .civit-details-box li, .civit-details-box span, .civit-details-box div {{ color: #d1d5db !important; line-height: 1.6; }} .civit-details-box a {{ color: #60a5fa !important; text-decoration: none; font-weight: 500; }} .civit-details-box a:hover {{ text-decoration: underline; }} .civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }} .civit-badge-prop {{ background-color: #374151 !important; color: #ffffff !important; padding: 6px 12px; border-radius: 6px; display: inline-block; font-size: 0.9em; margin-right: 10px; margin-bottom: 10px; border: 1px solid #4b5563; font-weight: 500; }}</style><div class="civit-details-box"><h1>{name}</h1><div style="margin-bottom: 20px;"><span class="civit-badge-prop">👤 <b>{creator}</b></span><span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span><span class="civit-badge-prop">🏷 {tags}</span></div><div>{desc}</div></div>"""
+        info_html = f"""
+        <style>
+            .civit-details-box {{
+                background-color: #1f2937; 
+                color: #ffffff !important; 
+                padding: 20px; 
+                border-radius: 12px; 
+                border: 1px solid #374151;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }}
+            /* Force all children to be white/light */
+            .civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; }}
+            .civit-details-box p, 
+            .civit-details-box li, 
+            .civit-details-box span, 
+            .civit-details-box div {{ 
+                color: #e5e7eb !important; 
+                line-height: 1.6;
+            }}
+            .civit-details-box a {{ color: #60a5fa !important; text-decoration: underline; }}
+            .civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }}
+            
+            /* Badge styling for Properties */
+            .civit-badge-prop {{
+                background-color: #374151 !important;
+                color: #ffffff !important;
+                padding: 6px 10px;
+                border-radius: 6px;
+                display: inline-block;
+                font-size: 0.9em;
+                margin-right: 8px;
+                margin-bottom: 8px;
+                border: 1px solid #4b5563;
+            }}
+        </style>
+        
+        <div class="civit-details-box">
+            <h1>{name}</h1>
+            
+            <div style="margin-bottom: 20px;">
+                <span class="civit-badge-prop">🛠 <b>{creator}</b></span>
+                <span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span>
+                <span class="civit-badge-prop">🏷 {tags}</span>
+            </div>
+            
+            <hr style="border-top: 1px solid #4a4d55; margin-bottom: 20px;">
+            
+            <div>
+                {desc}
+            </div>
+        </div>
+        """
         
         versions = full_data.get('modelVersions', [])
         if not versions and 'version' in full_data: versions = [full_data['version']]
         ver_choices = [(f"{v['name']} ({v.get('baseModel','?')})", v['id']) for v in versions]
         first_ver = ver_choices[0][1] if ver_choices else None
         
-        return gr.Tabs(selected="details_tab"), html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}"
+        return gr.Tabs(selected="details_tab"), info_html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}"
 
     def update_version_files(self, version_id, model_data):
         if not model_data or not version_id: return gr.update(choices=[]), ""
@@ -801,23 +968,27 @@ class LoraManagerPlugin(WAN2GPPlugin):
             label = f"{f.get('type','Model')} | {f['name']} | {round(f.get('sizeKB',0)/1024, 2)} MB"
             file_opts.append((label, f['downloadUrl']))
         
-        media_html = "<div style='display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:15px;'>"
+        media_html = "<div style='display:grid; grid-template-columns:repeat(auto-fill, minmax(250px, 1fr)); gap:15px;'>"
         for img in version.get('images', []):
             url = img.get('url')
             if not url: continue
             is_vid = img.get('type') == 'video' or url.endswith(('.mp4','.webm'))
             src = self.construct_media_url(url, 450, is_vid) if url and "http" not in url else url
+            
+            cell_style = "width:100%; aspect-ratio:2/3; background:#000; border-radius:8px; overflow:hidden; border:1px solid #333; position:relative;"
+            media_style = "width:100%; height:100%; object-fit:contain; display:block;"
+
             if is_vid:
                 poster = self.construct_media_url(url, 450, False) if url and "http" not in url else ""
                 media_html += f"""
-                <div style='background:#111; border-radius:8px; overflow:hidden; border: 1px solid #333; aspect-ratio:2/3;'>
+                <div style='{cell_style}'>
                     <video src='{src}' poster='{poster}' loop muted playsinline controls 
                            onmouseover="this.play()" onmouseout="this.pause()" 
-                           style='width:100%;height:100%;object-fit:contain;display:block;'>
+                           style='{media_style}'>
                     </video>
                 </div>"""
             else:
-                media_html += f"<div style='background:#111; border-radius:8px; overflow:hidden; border: 1px solid #333; aspect-ratio:2/3;'><img src='{src}' loading='lazy' style='width:100%;height:100%;object-fit:contain;display:block;'></div>"
+                media_html += f"<div style='{cell_style}'><img src='{src}' loading='lazy' style='{media_style}'></div>"
         media_html += "</div>"
         
         return gr.update(choices=file_opts, value=file_opts[0][1] if file_opts else None), media_html
