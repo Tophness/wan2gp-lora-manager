@@ -64,7 +64,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.4.0"
+        self.version = "2.5.0"
         self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -772,6 +772,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def on_select_model(self, model_id_str, current_items, api_key):
         if not model_id_str:
             return gr.update(), "", gr.update(), {}, "Ready", gr.update(value="loras")
+        
         try: mid = int(model_id_str)
         except: return gr.update(), "", gr.update(), {}, "Invalid ID", gr.update()
 
@@ -786,18 +787,29 @@ class LoraManagerPlugin(WAN2GPPlugin):
         creator = full_data.get('creator', {}).get('username', 'Unknown')
         desc = full_data.get('description', 'No description.')
         tags = ", ".join(full_data.get('tags', []))
-        
-        versions = full_data.get('modelVersions', [])
-        base_model = "Unknown"
-        if versions: base_model = versions[0].get('baseModel', 'Unknown')
-        elif 'version' in full_data: base_model = full_data['version'].get('baseModel', 'Unknown')
-            
-        target_path = self.resolve_target_folder(base_model)
 
-        info_html = f"""<style>.civit-details-box {{background-color: #1f2937; color: #ffffff !important; padding: 20px; border-radius: 12px; border: 1px solid #374151; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;}}.civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; }}.civit-details-box p, .civit-details-box li, .civit-details-box span, .civit-details-box div {{ color: #e5e7eb !important; line-height: 1.6;}}.civit-details-box a {{ color: #60a5fa !important; text-decoration: underline; }}.civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }}.civit-badge-prop {{background-color: #374151 !important;color: #ffffff !important;padding: 6px 10px;border-radius: 6px;display: inline-block;font-size: 0.9em;margin-right: 8px;margin-bottom: 8px;border: 1px solid #4b5563;}}</style><div class="civit-details-box"><h1>{name}</h1><div style="margin-bottom: 20px;"><span class="civit-badge-prop">🛠 <b>{creator}</b></span><span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span><span class="civit-badge-prop">🧩 <b>{base_model}</b></span><span class="civit-badge-prop">🏷 {tags}</span></div><hr style="border-top: 1px solid #4a4d55; margin-bottom: 20px;"><div>{desc}</div></div>"""
-        
         versions = full_data.get('modelVersions', [])
         if not versions and 'version' in full_data: versions = [full_data['version']]
+
+        default_ver = versions[0] if versions else {}
+        is_checkpoint = False
+
+        for f in default_ver.get('files', []):
+            if f.get('metadata', {}).get('size') == 'full':
+                is_checkpoint = True
+                break
+
+        if not is_checkpoint and full_data.get('type') == 'Checkpoint':
+            is_checkpoint = True
+
+        if is_checkpoint:
+            target_path = os.path.abspath(self.finetunes_root)
+        else:
+            base_model = default_ver.get('baseModel', 'Unknown')
+            target_path = self.resolve_target_folder(base_model)
+
+        info_html = f"""<style>.civit-details-box {{background-color: #1f2937; color: #ffffff !important; padding: 20px; border-radius: 12px; border: 1px solid #374151; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;}}.civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; }}.civit-details-box p, .civit-details-box li, .civit-details-box span, .civit-details-box div {{ color: #e5e7eb !important; line-height: 1.6;}}.civit-details-box a {{ color: #60a5fa !important; text-decoration: underline; }}.civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }}.civit-badge-prop {{background-color: #374151 !important;color: #ffffff !important;padding: 6px 10px;border-radius: 6px;display: inline-block;font-size: 0.9em;margin-right: 8px;margin-bottom: 8px;border: 1px solid #4b5563;}}</style><div class="civit-details-box"><h1>{name}</h1><div style="margin-bottom: 20px;"><span class="civit-badge-prop">🛠 <b>{creator}</b></span><span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span><span class="civit-badge-prop">🧩 <b>{default_ver.get('baseModel', 'Unknown')}</b></span><span class="civit-badge-prop">🏷 {tags}</span></div><hr style="border-top: 1px solid #4a4d55; margin-bottom: 20px;"><div>{desc}</div></div>"""
+        
         ver_choices = [(f"{v['name']} ({v.get('baseModel','?')})", v['id']) for v in versions]
         first_ver = ver_choices[0][1] if ver_choices else None
         
@@ -809,9 +821,21 @@ class LoraManagerPlugin(WAN2GPPlugin):
         if not versions and 'version' in model_data: versions = [model_data['version']]
         version = next((v for v in versions if v['id'] == version_id), None)
         if not version: return gr.update(choices=[]), "Version info missing", gr.update()
+        is_checkpoint = False
+        
+        for f in version.get('files', []):
+            if f.get('metadata', {}).get('size') == 'full':
+                is_checkpoint = True
+                break
 
-        base_model = version.get('baseModel', 'Unknown')
-        new_target_folder = self.resolve_target_folder(base_model)
+        if not is_checkpoint and model_data.get('type') == 'Checkpoint':
+             is_checkpoint = True
+
+        if is_checkpoint:
+            new_target_folder = os.path.abspath(self.finetunes_root)
+        else:
+            base_model = version.get('baseModel', 'Unknown')
+            new_target_folder = self.resolve_target_folder(base_model)
 
         file_opts = []
         for f in version.get('files', []):
@@ -824,19 +848,11 @@ class LoraManagerPlugin(WAN2GPPlugin):
             if not url: continue
             is_vid = img.get('type') == 'video' or url.endswith(('.mp4','.webm'))
             src = self.construct_media_url(url, 450, is_vid) if url and "http" not in url else url
-            
             cell_style = "width:100%; aspect-ratio:2/3; background:#000; border-radius:8px; overflow:hidden; border:1px solid #333; position:relative;"
             media_style = "width:100%; height:100%; object-fit:contain; display:block;"
-
             if is_vid:
                 poster = self.construct_media_url(url, 450, False) if url and "http" not in url else ""
-                media_html += f"""
-                <div style='{cell_style}'>
-                    <video src='{src}' poster='{poster}' loop muted playsinline controls 
-                           onmouseover="this.play()" onmouseout="this.pause()" 
-                           style='{media_style}'>
-                    </video>
-                </div>"""
+                media_html += f"<div style='{cell_style}'><video src='{src}' poster='{poster}' loop muted playsinline controls onmouseover=\"this.play()\" onmouseout=\"this.pause()\" style='{media_style}'></video></div>"
             else:
                 media_html += f"<div style='{cell_style}'><img src='{src}' loading='lazy' style='{media_style}'></div>"
         media_html += "</div>"
@@ -845,17 +861,33 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
     def download_model(self, url, key, state, model_data, target_dir_input):
         if not url: return "No file selected"
-        
-        model_type = model_data.get('type', '')
-        if model_type == 'Checkpoint':
+        is_checkpoint = False
+
+        if model_data.get('type') == 'Checkpoint':
+            is_checkpoint = True
+        else:
+            versions = model_data.get('modelVersions', [])
+            found = False
+            for v in versions:
+                for f in v.get('files', []):
+                    if f.get('downloadUrl') == url:
+                        if f.get('metadata', {}).get('size') == 'full':
+                            is_checkpoint = True
+                        found = True
+                        break
+                if found: break
+
+        if is_checkpoint:
             return self.create_finetune_definition(url, model_data)
 
         target_dir = target_dir_input.strip()
         if not target_dir: target_dir = "loras"
         
         if not os.path.exists(target_dir):
-            try: os.makedirs(target_dir, exist_ok=True)
-            except Exception as e: return f"Error creating directory '{target_dir}': {e}"
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                return f"Error creating directory '{target_dir}': {e}"
 
         try:
             r = requests.get(url, headers=self.get_headers(key), stream=True)
@@ -873,6 +905,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                             break
             
             save_path = os.path.join(target_dir, fname)
+            
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(1024*1024): f.write(chunk)
 
@@ -936,9 +969,10 @@ class LoraManagerPlugin(WAN2GPPlugin):
         return gr.Tabs(selected="plugin_civitai_browser_tab"), str(mid), None
 
     def on_tab_select(self, state):
-        if getattr(self, 'has_loaded_once', False): return gr.update(), gr.update(), gr.update()
-        self.has_loaded_once = True
-        return self.force_refresh(state, None, None)
+        if not self.category_dropdown.choices:
+            _, category_update, lora_list_update = self.force_refresh(state, None, None)
+            return gr.update(value=True), category_update, lora_list_update
+        return gr.update(value=True), gr.update(), gr.update()
 
     def resolve_path(self, item_name):
         is_recursive = os.path.sep in item_name or "/" in item_name
