@@ -64,7 +64,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.5.1"
+        self.version = "2.5.3"
         self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -807,7 +807,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             is_checkpoint = True
 
         if is_checkpoint:
-            target_path = os.path.abspath(self.finetunes_root)
+            target_path = os.path.abspath("ckpts")
         else:
             base_model = default_ver.get('baseModel', 'Unknown')
             target_path = self.resolve_target_folder(base_model)
@@ -836,7 +836,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
              is_checkpoint = True
 
         if is_checkpoint:
-            new_target_folder = os.path.abspath(self.finetunes_root)
+            new_target_folder = os.path.abspath("ckpts")
         else:
             base_model = version.get('baseModel', 'Unknown')
             new_target_folder = self.resolve_target_folder(base_model)
@@ -845,7 +845,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
         for f in version.get('files', []):
             label = f"{f.get('type','Model')} | {f['name']} | {round(f.get('sizeKB',0)/1024, 2)} MB"
             file_opts.append((label, f['downloadUrl']))
-        
+
         media_html = "<div style='display:grid; grid-template-columns:repeat(auto-fill, minmax(250px, 1fr)); gap:15px;'>"
         for img in version.get('images', []):
             url = img.get('url')
@@ -882,7 +882,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 if found: break
 
         if is_checkpoint:
-            return self.create_finetune_definition(url, model_data)
+            return self.create_finetune_definition(url, model_data, key, target_dir_input)
 
         target_dir = target_dir_input.strip()
         if not target_dir: target_dir = "loras"
@@ -896,34 +896,64 @@ class LoraManagerPlugin(WAN2GPPlugin):
         try:
             r = requests.get(url, headers=self.get_headers(key), stream=True)
             r.raise_for_status()
-            
+
             fname = "model.safetensors"
+            selected_version = None
+            
+            versions = model_data.get('modelVersions', [])
+            for v in versions:
+                for f in v.get('files', []):
+                    if f['downloadUrl'] == url:
+                        fname = f['name']
+                        selected_version = v
+                        break
+                if selected_version: break
+
             if "content-disposition" in r.headers and "filename=" in r.headers["content-disposition"]:
                 fname = r.headers["content-disposition"].split("filename=")[1].strip('"').strip(';')
-            else:
-                versions = model_data.get('modelVersions', [])
-                for v in versions:
-                    for f in v.get('files', []):
-                        if f['downloadUrl'] == url:
-                            fname = f['name']
-                            break
             
             save_path = os.path.join(target_dir, fname)
-            
+
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(1024*1024): f.write(chunk)
 
             mid = model_data.get('id')
-            if mid:
-                self._fetch_and_process_single_lora(save_path)
-                _, local_prev = self.get_local_preview_path(mid)
-                if not local_prev and model_data.get('images'): 
-                    self.download_preview_image(model_data['images'][0]['url'], mid)
-            
-            return f"Saved to {save_path}"
-        except Exception as e: return f"Error: {e}"
+            if mid and selected_version:
+                json_path = self.get_civitai_json_path(save_path)
 
-    def create_finetune_definition(self, download_url, model_data):
+                meta_payload = selected_version.copy()
+                meta_payload['modelId'] = mid
+                meta_payload['model'] = {
+                    'name': model_data.get('name'),
+                    'type': model_data.get('type'),
+                    'nsfw': model_data.get('nsfw'),
+                    'poi': model_data.get('poi')
+                }
+                
+                try:
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(meta_payload, f, indent=4)
+                except Exception as e:
+                    print(f"Error saving metadata JSON: {e}")
+
+                _, local_prev = self.get_local_preview_path(mid)
+                if not local_prev:
+                    images = selected_version.get('images', [])
+                    if not images: images = model_data.get('images', [])
+                    
+                    if images:
+                        self.download_preview_image(images[0]['url'], mid)
+
+                triggers = selected_version.get('trainedWords', [])
+                if triggers:
+                    self.write_lset(save_path, ", ".join(triggers))
+
+            return f"Saved to {save_path}"
+        except Exception as e: 
+            traceback.print_exc()
+            return f"Error: {e}"
+
+    def create_finetune_definition(self, download_url, model_data, api_key, target_dir=None):
         civit_base = "Unknown"
         versions = model_data.get('modelVersions', [])
         selected_version = None
@@ -941,11 +971,37 @@ class LoraManagerPlugin(WAN2GPPlugin):
         if not wangp_arch:
             return f"Error: Could not map CivitAI Base Model '{civit_base}' to a WanGP Architecture. Manual download required."
 
+        ckpt_dir = target_dir if target_dir else os.path.abspath("ckpts")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        try:
+            r = requests.get(download_url, headers=self.get_headers(api_key), stream=True)
+            r.raise_for_status()
+            
+            fname = "model.safetensors"
+            if "content-disposition" in r.headers and "filename=" in r.headers["content-disposition"]:
+                fname = r.headers["content-disposition"].split("filename=")[1].strip('"').strip(';')
+            else:
+                if selected_version:
+                    for f in selected_version.get('files', []):
+                        if f['downloadUrl'] == download_url:
+                            fname = f['name']
+                            break
+            
+            ckpt_path = os.path.join(ckpt_dir, fname)
+
+            with open(ckpt_path, 'wb') as f:
+                for chunk in r.iter_content(1024*1024): 
+                    if chunk: f.write(chunk)
+                    
+        except Exception as e:
+            return f"Error downloading checkpoint: {e}"
+
         safe_name = "".join([c for c in model_data.get('name', 'Unknown') if c.isalnum() or c in (' ', '-', '_')]).strip()
         filename = safe_name.replace(" ", "_") + ".json"
         save_path = os.path.join(self.finetunes_root, filename)
         
-        trained_words = selected_version.get('trainedWords', [])
+        trained_words = selected_version.get('trainedWords', []) if selected_version else []
         prompt_str = ", ".join(trained_words) if trained_words else ""
         description = f"Imported from CivitAI. Base: {civit_base}. {model_data.get('description', '')[:200]}..."
         
@@ -956,7 +1012,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 "name": model_data.get('name', 'Unknown'),
                 "architecture": wangp_arch,
                 "description": description,
-                "URLs": [download_url],
+                "URLs": [fname],
                 "auto_quantize": True
             }
         }
@@ -965,7 +1021,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             with open(save_path, 'w', encoding='utf-8') as f: json.dump(finetune_data, f, indent=4)
             mid = model_data.get('id')
             if mid and model_data.get('images'): self.download_preview_image(model_data['images'][0]['url'], mid)
-            return f"Created Finetune Definition: {filename}. Restart WanGP to see it."
+            return f"Downloaded checkpoint to {ckpt_path} and created Finetune Definition: {filename}. Restart WanGP to see it."
         except Exception as e: return f"Error creating finetune definition: {e}"
 
     def bridge_manager_to_browser(self, mid):
