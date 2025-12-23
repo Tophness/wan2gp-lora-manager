@@ -64,7 +64,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.5.0"
+        self.version = "2.5.1"
         self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -424,7 +424,11 @@ class LoraManagerPlugin(WAN2GPPlugin):
                         value=self.saved_settings.get("api_key", ""),
                         info="Required for NSFW content and downloading certain models."
                     )
-                    gr.Markdown('🔑 Get your API key from [civitai.com/user/account](https://civitai.com/user/account)')
+                    gr.Markdown(
+                        '🔑 Get your API key from '
+                        '[civitai.com/user/account](https://civitai.com/user/account) '
+                        'by clicking **“Add API key”** under the **API Keys** section.'
+                    )
                     self.auto_fetch_chk = gr.Checkbox(
                         label="Auto-fetch from CivitAI on select", 
                         value=self.saved_settings.get("auto_fetch", False)
