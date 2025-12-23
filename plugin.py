@@ -2,14 +2,12 @@ import gradio as gr
 import os
 import json
 import hashlib
-import urllib.request
 import requests
 import time
 import shutil
 import tempfile
 import cv2
 import base64
-from datetime import datetime
 from shared.utils.plugins import WAN2GPPlugin
 
 CIVITAI_HOST = "https://civitai.com"
@@ -23,23 +21,41 @@ PERIOD_OPTIONS = ["AllTime", "Year", "Month", "Week", "Day"]
 MODEL_TYPES = [
     "Checkpoint", "LORA", "TextualInversion", "Hypernetwork", 
     "AestheticGradient", "Controlnet", "Poses", "Wildcards", 
-    "Workflows", "MotionModule", "VAE", "Upscaler", "LoCon", "DoRA"
+    "Workflows", "MotionModule", "VAE", "Upscaler", "LoCon", "DoRA", "Detection", "Other"
 ]
 BASE_MODELS = [
-    "SD 1.4", "SD 1.5", "SD 1.5 LCM", "SD 1.5 Hyper", "SD 2.0", "SD 2.1",
-    "SDXL 1.0", "SDXL Lightning", "SDXL Hyper", "Pony", "Pony V7",
-    "Flux.1 S", "Flux.1 D", "Flux.1 Krea", "Flux.1 Kontext", "Flux.2 D",
-    "Wan Video 14B t2v", "Wan Video 14B i2v 720p", "Wan Video 14B i2v 480p",
-    "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 I2V-A14B", 
-    "Wan Video 2.5 T2V", "Wan Video 2.5 I2V",
-    "PixArt α", "PixArt Σ", "Hunyuan 1", "Hunyuan Video", "Lumina", "Kolors", "AuraFlow", "Mochi", "Z Image Turbo"
+    "AuraFlow", "Chroma", "CogVideoX", "Flux.1 S", "Flux.1 D", "Flux.1 Krea",
+    "Flux.1 Kontext", "Flux.2 D", "HiDream", "Hunyuan 1", "Hunyuan Video",
+    "Illustrious", "Kolors", "LTXV", "Lumina", "Mochi", "NoobAI", "Other",
+    "PixArt a", "PixArt E", "Pony", "Pony V7", "Qwen", "SD 1.4", "SD 1.5",
+    "SD 1.5 LCM", "SD 1.5 Hyper", "SD 2.0", "SD 2.1", "SDXL 1.0",
+    "SDXL Lightning", "SDXL Hyper", "Wan Video 1.3B t2v", "Wan Video 14B t2v",
+    "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p", "Wan Video 2.2 TI2V-5B",
+    "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B", "Wan Video 2.5 T2V",
+    "Wan Video 2.5 I2V", "ZImageTurbo"
 ]
+DEFAULT_BASE_SELECTION = []
 
-DEFAULT_BASE_SELECTION = [
-    "Wan Video 14B t2v", "Wan Video 14B i2v 720p", "Wan Video 14B i2v 480p",
-    "Wan Video 2.2 T2V-A14B", "Wan Video 2.2 I2V-A14B", 
-    "Wan Video 2.5 T2V", "Wan Video 2.5 I2V"
-]
+CIVIT_TO_WANGP_ARCH = {
+    "Wan Video 14B t2v": "t2v",
+    "Wan Video 1.3B t2v": "t2v_1.3B",
+    "Wan Video 14B i2v 480p": "i2v",
+    "Wan Video 14B i2v 720p": "i2v",
+    "Wan Video 2.2 T2V-A14B": "t2v",
+    "Wan Video 2.2 I2V-A14B": "t2v",
+    "Wan Video 2.2 TI2V-5B": "ti2v_2_2",
+    "Hunyuan Video": "hunyuan_1_5_t2v",
+    "Hunyuan 1": "hunyuan",
+    "Flux.1 D": "flux",
+    "Flux.1 S": "flux_schnell",
+    "Flux.1 Krea": "flux",
+    "Flux.1 Kontext": "flux_dev_kontext",
+    "Flux.2 D": "flux2_dev",
+    "LTXV": "ltxv_13B",
+    "Qwen": "qwen_image_20B",
+    "ZImageTurbo": "z_image",
+    "Mochi": "mocha"
+}
 
 PLACEHOLDER_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>"""
 PLACEHOLDER_B64 = f"data:image/svg+xml;base64,{base64.b64encode(PLACEHOLDER_SVG.encode('utf-8')).decode('utf-8')}"
@@ -48,27 +64,30 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.0.2"
-        self.description = "Manage local LoRAs and browse CivitAI."
+        self.version = "2.4.0"
+        self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.lora_root = "loras" 
-        self.db_path = os.path.join(self.plugin_dir, "lora_db.json")
+        self.finetunes_root = "finetunes"
+        self.metadata_root = "loras_metadata"
+        
         self.settings_path = os.path.join(self.plugin_dir, "settings.json")
         
         self.previews_dir = os.path.abspath(os.path.join("icons", "lora_previews"))
         os.makedirs(self.previews_dir, exist_ok=True)
+        os.makedirs(self.metadata_root, exist_ok=True)
         
-        self.lora_metadata = {}
-        self.saved_settings = {}
+        if not os.path.exists(self.finetunes_root):
+            try: os.makedirs(self.finetunes_root, exist_ok=True)
+            except: pass
 
+        self.saved_settings = {}
         self.items_cache = []
         self.cursor_cache = None
-
         self.manager_to_browser_btn = None
         self.manager_to_browser_state = None
         self.civit_tabs = None
-
         self.api_key = None
 
     def setup_ui(self):
@@ -82,7 +101,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.request_component("loras_choices")
         self.request_component("main_tabs")
         
-        self.load_json_db()
         self.load_settings()
         
         self.on_tab_outputs = [] 
@@ -167,7 +185,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 json.dump(self.saved_settings, f, indent=4)
         except Exception as e: print(f"Error saving settings: {e}")
 
-
     def get_headers(self, api_key: str = "") -> dict:
         headers = {
             "User-Agent": USER_AGENT,
@@ -229,7 +246,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
                     shutil.copyfileobj(r.raw, f)
         except Exception as e: print(f"Preview download error: {e}")
 
-
     def generate_hash(self, file_path):
         hash_sha256 = hashlib.sha256()
         with open(file_path, "rb") as f:
@@ -247,21 +263,56 @@ class LoraManagerPlugin(WAN2GPPlugin):
             return data, None
         except Exception as e: return None, str(e)
 
-    def get_sidecar_json_path(self, lora_path):
-        return os.path.splitext(lora_path)[0] + ".json"
+    def get_civitai_json_path(self, lora_full_path):
+        rel_path = os.path.relpath(lora_full_path, self.lora_root)
+        meta_dir = os.path.join(self.metadata_root, os.path.dirname(rel_path))
+        if not os.path.exists(meta_dir): os.makedirs(meta_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(rel_path))[0]
+        return os.path.join(meta_dir, base_name + ".json")
 
-    def format_date(self, date_str):
-        if not date_str: return "N/A"
+    def get_lset_path(self, lora_full_path):
+        return os.path.splitext(lora_full_path)[0] + ".lset"
+
+    def read_lset_data(self, lora_full_path):
+        lset_path = self.get_lset_path(lora_full_path)
+        if os.path.exists(lset_path):
+            try:
+                with open(lset_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return {}
+
+    def read_lset_prompt_string(self, lora_full_path):
+        data = self.read_lset_data(lora_full_path)
+        raw = data.get("prompt", "")
+        if isinstance(raw, list): return ", ".join(raw)
+        return str(raw).strip()
+
+    def write_lset(self, lora_full_path, prompt):
+        lset_path = self.get_lset_path(lora_full_path)
+        filename = os.path.basename(lora_full_path)
+
+        existing = self.read_lset_data(lora_full_path)
+        lora_list = existing.get("loras", [filename])
+        
+        data = {
+            "loras": lora_list,
+            "prompt": prompt
+        }
+        
         try:
-            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d")
-        except: return date_str
+            with open(lset_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+            return True
+        except Exception as e:
+            print(f"Error writing lset: {e}")
+            return False
 
-    def _fetch_and_process_single_lora(self, full_path, key):
+    def _fetch_and_process_single_lora(self, full_path, key=None):
         data, err = self.fetch_civitai_data_by_hash(full_path)
         if err: return False, err
 
-        dest = self.get_sidecar_json_path(full_path)
+        dest = self.get_civitai_json_path(full_path)
         try:
             with open(dest, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4)
         except Exception as e: return False, f"JSON save failed: {e}"
@@ -284,21 +335,27 @@ class LoraManagerPlugin(WAN2GPPlugin):
         if mid and img_url: self.download_preview_image(img_url, mid)
 
         trained_words = data.get('trainedWords', [])
-        prompt_updated = False
-        current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
+        current_prompt = self.read_lset_prompt_string(full_path)
         
+        updated_prompt = False
         if trained_words and not current_prompt:
             new_prompt = ", ".join(trained_words)
-            if key not in self.lora_metadata: self.lora_metadata[key] = {}
-            self.lora_metadata[key]["prompt"] = new_prompt
-            try:
-                with open(self.db_path, 'w', encoding='utf-8') as f: json.dump(self.lora_metadata, f, indent=4)
-                prompt_updated = True
-            except: pass
+            if self.write_lset(full_path, new_prompt):
+                updated_prompt = True
 
         msg = "Metadata updated."
-        if prompt_updated: msg += " Default prompt set from triggers."
+        if updated_prompt: msg += " Default prompt set in .lset."
         return True, msg
+
+    def resolve_target_folder(self, base_model_name):
+        internal_key = CIVIT_TO_WANGP_ARCH.get(base_model_name)
+        fallback_path = os.path.abspath("loras")
+        if not internal_key: return fallback_path
+        try:
+            path = self.get_lora_dir(internal_key)
+            if path and os.path.isdir(path): return os.path.abspath(path)
+        except: pass
+        return fallback_path
 
     def batch_update_metadata(self, state, category, current_files, progress=gr.Progress()):
         self.lora_root = self.discover_lora_root(state)
@@ -326,17 +383,13 @@ class LoraManagerPlugin(WAN2GPPlugin):
         error_count = 0
         
         for i, item_name in enumerate(progress.tqdm(files_to_process, desc="Updating Metadata")):
-            full_path = ""
-            key = ""
             if category == "All LoRAs":
                 full_path = os.path.join(self.lora_root, item_name)
-                key = item_name.replace("\\", "/")
             else:
                 full_path = os.path.join(self.lora_root, category, item_name)
-                key = os.path.join(category, item_name).replace("\\", "/")
 
             if os.path.exists(full_path):
-                success, msg = self._fetch_and_process_single_lora(full_path, key)
+                success, msg = self._fetch_and_process_single_lora(full_path)
                 if success: updated_count += 1
                 else: error_count += 1
             time.sleep(0.1)
@@ -371,11 +424,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                         value=self.saved_settings.get("api_key", ""),
                         info="Required for NSFW content and downloading certain models."
                     )
-                    gr.Markdown(
-                        '🔑 Get your API key from '
-                        '[civitai.com/user/account](https://civitai.com/user/account) '
-                        'by clicking **“Add API key”** under the **API Keys** section.'
-                    )
+                    gr.Markdown('🔑 Get your API key from [civitai.com/user/account](https://civitai.com/user/account)')
                     self.auto_fetch_chk = gr.Checkbox(
                         label="Auto-fetch from CivitAI on select", 
                         value=self.saved_settings.get("auto_fetch", False)
@@ -396,13 +445,14 @@ class LoraManagerPlugin(WAN2GPPlugin):
                     gr.Markdown(f"### 📝 Details ({len(selected_items)} selected)")
 
                     for lora_name in selected_items:
-                        key, full_path = self.resolve_path(lora_name)
-                        current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
-                        json_path = self.get_sidecar_json_path(full_path)
+                        full_path = self.resolve_path(lora_name)
+                        
+                        current_prompt_str = self.read_lset_prompt_string(full_path)
+                        json_path = self.get_civitai_json_path(full_path)
                         
                         if not os.path.exists(json_path) and auto_fetch:
-                            self._fetch_and_process_single_lora(full_path, key)
-                            current_prompt = self.lora_metadata.get(key, {}).get("prompt", "")
+                            self._fetch_and_process_single_lora(full_path)
+                            current_prompt_str = self.read_lset_prompt_string(full_path)
 
                         civitai_data = None
                         if os.path.exists(json_path):
@@ -416,7 +466,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
                             
                             if civitai_data:
                                 model_id = civitai_data.get('modelId')
-
                                 images_list = civitai_data.get('images', [])
                                 if images_list:
                                     img_urls = [img.get('url') for img in images_list[:4]]
@@ -431,18 +480,11 @@ class LoraManagerPlugin(WAN2GPPlugin):
                                 with gr.Row():
                                     if model_id:
                                         view_btn = gr.Button("🔍 Browse on CivitAI", size="sm", variant="secondary")
-                                        view_btn.click(
-                                            fn=lambda m=model_id: m, 
-                                            inputs=None, 
-                                            outputs=[self.manager_to_browser_state]
-                                        ).then(
-                                            fn=None, 
-                                            js="window.triggerManagerToBrowser"
-                                        )
+                                        view_btn.click(fn=lambda m=model_id: m, inputs=None, outputs=[self.manager_to_browser_state]).then(fn=None, js="window.triggerManagerToBrowser")
                                     
                                     upd_btn = gr.Button("🔄 Update Info", size="sm")
-                                    def do_upd(fp=full_path, k=key, cur_val=trig_val):
-                                        self._fetch_and_process_single_lora(fp, k)
+                                    def do_upd(fp=full_path, cur_val=trig_val):
+                                        self._fetch_and_process_single_lora(fp)
                                         return (cur_val or 0) + 1
                                     upd_btn.click(fn=do_upd, inputs=None, outputs=[self.refresh_trigger])
 
@@ -452,53 +494,50 @@ class LoraManagerPlugin(WAN2GPPlugin):
                             else:
                                 gr.Markdown("*No metadata found.*")
                                 man_fetch = gr.Button("🌐 Fetch Info", size="sm")
-                                def do_fetch(fp=full_path, k=key, cur_val=trig_val):
-                                    self._fetch_and_process_single_lora(fp, k)
+                                def do_fetch(fp=full_path, cur_val=trig_val):
+                                    self._fetch_and_process_single_lora(fp)
                                     return (cur_val or 0) + 1
                                 man_fetch.click(fn=do_fetch, inputs=None, outputs=[self.refresh_trigger])
 
-                            key_state = gr.State(key)
-                            prompt_input = gr.TextArea(value=current_prompt, label="Trigger / Prompt", lines=2)
+                            path_state = gr.State(full_path)
+                            prompt_input = gr.TextArea(value=current_prompt_str, label="Default Prompt", lines=2)
                             save_btn = gr.Button("💾 Save Prompt", size="sm")
-                            save_btn.click(fn=self.save_metadata, inputs=[key_state, prompt_input], outputs=None)
+                            save_btn.click(fn=self.save_lset_prompt, inputs=[path_state, prompt_input], outputs=None)
                         gr.Markdown("---")
 
                 with gr.Column(visible=False) as self.actions_panel:
                     gr.Markdown("### Inject to Generator")
+                    self.prompt_select_group = gr.CheckboxGroup(label="Select Prompts", choices=[])
+                    self.lora_select_group = gr.CheckboxGroup(label="Select LoRAs", choices=[])
+                    
                     with gr.Row():
-                        self.prompt_mode = gr.Radio(["Append", "Overwrite"], value="Append", label="Prompt Mode")
-                        self.lora_mode = gr.Radio(["Append", "Overwrite"], value="Append", label="List Mode")
+                        self.prompt_mode = gr.Radio(["Append To Current Prompts", "Overwrite Current Prompts"], value="Append To Current Prompts", label="Prompt Injection Mode")
+                        self.lora_mode = gr.Radio(["Append To Current Loras", "Overwrite Current Loras"], value="Append To Current Loras", label="Lora Injection Mode")
                     self.use_btn = gr.Button("✨ Send to Generator", variant="primary")
 
         self.on_tab_outputs = [self.is_initialized, self.category_dropdown, self.lora_html_list]
 
-        self.category_dropdown.change(
-            self.render_lora_grid, 
-            [self.state, self.category_dropdown, self.lora_selection_state], 
-            [self.lora_html_list]
-        )
-        
-        self.refresh_btn.click(
-            self.ui_refresh_click, 
-            [self.state, self.category_dropdown, self.lora_selection_state], 
-            [self.category_dropdown, self.lora_html_list]
-        )
-        
+        self.category_dropdown.change(self.render_lora_grid, [self.state, self.category_dropdown, self.lora_selection_state], [self.lora_html_list])
+        self.refresh_btn.click(self.ui_refresh_click, [self.state, self.category_dropdown, self.lora_selection_state], [self.category_dropdown, self.lora_html_list])
         self.update_all_btn.click(self.batch_update_metadata, [self.state, self.category_dropdown, self.lora_selection_state], [self.refresh_trigger])
 
-        self.api_key.change(
-            lambda x: self.save_settings_to_disk(api_key=x), inputs=[self.api_key], outputs=None
-        )
-        self.auto_fetch_chk.change(
-            lambda x: self.save_settings_to_disk(auto_fetch=x), inputs=[self.auto_fetch_chk], outputs=None
-        )
-        self.preview_mode.change(
-            lambda x: self.save_settings_to_disk(preview_mode=x), inputs=[self.preview_mode], outputs=None
-        )
+        self.api_key.change(lambda x: self.save_settings_to_disk(api_key=x), inputs=[self.api_key], outputs=None)
+        self.auto_fetch_chk.change(lambda x: self.save_settings_to_disk(auto_fetch=x), inputs=[self.auto_fetch_chk], outputs=None)
+        self.preview_mode.change(lambda x: self.save_settings_to_disk(preview_mode=x), inputs=[self.preview_mode], outputs=None)
 
         self.lora_selection_bridge.change(fn=lambda x: json.loads(x) if x else [], inputs=[self.lora_selection_bridge], outputs=[self.lora_selection_state])
-        self.lora_selection_state.change(lambda x: gr.update(visible=bool(x)), self.lora_selection_state, self.actions_panel)
-        self.use_btn.click(self.finalize_injection, [self.lora_selection_state, self.prompt_mode, self.lora_mode, self.prompt, self.loras_choices], [self.prompt, self.loras_choices, self.main_tabs])
+
+        self.lora_selection_state.change(
+            self.update_action_options, 
+            [self.lora_selection_state], 
+            [self.prompt_select_group, self.lora_select_group, self.actions_panel]
+        )
+
+        self.use_btn.click(
+            self.finalize_injection, 
+            [self.prompt_select_group, self.lora_select_group, self.prompt_mode, self.lora_mode, self.prompt, self.loras_choices], 
+            [self.prompt, self.loras_choices, self.main_tabs]
+        )
 
     def create_browser_ui(self):
         self.civit_items = gr.State([])
@@ -537,7 +576,10 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 with gr.Row():
                     self.ver_dd = gr.Dropdown(label="Version", interactive=True)
                     self.file_dd = gr.Dropdown(label="File", interactive=True)
-                    self.dl_btn = gr.Button("Download to Wan2GP", variant="primary")
+                
+                self.target_folder = gr.Textbox(label="Target Folder / Category", value="loras", interactive=True)
+                
+                self.dl_btn = gr.Button("Download to Wan2GP", variant="primary")
                 self.dl_status = gr.Textbox(label="Download Status", interactive=False)
                 self.media_area = gr.HTML()
 
@@ -552,16 +594,16 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
         self.search_btn.click(self.run_search, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key], [self.html_results, self.civit_items, self.civit_cursor, self.status])
         self.load_more_btn.click(self.run_more, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key, self.civit_cursor, self.civit_items], [self.html_results, self.civit_items, self.civit_cursor, self.status])
-        self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area])
-        self.ver_dd.change(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area])
+        self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status, self.target_folder]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
+        self.ver_dd.change(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
+
         self.back_btn.click(lambda: gr.Tabs(selected="browse_tab"), None, self.civit_tabs)
-        self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data], [self.dl_status])
+        self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data, self.target_folder], [self.dl_status])
         self.search_btn.click()
 
     def render_lora_grid(self, state, category, selected_list):
         self.lora_root = self.discover_lora_root(state)
         files = []
-        
         if category == "All LoRAs":
             for root, dirs, f_names in os.walk(self.lora_root):
                 dirs[:] = [d for d in dirs if not d.startswith('.')]
@@ -575,62 +617,22 @@ class LoraManagerPlugin(WAN2GPPlugin):
             for f in os.listdir(target_dir):
                 if f.endswith(".safetensors") or f.endswith(".sft"):
                     files.append(f)
-        
         files.sort()
         
-        html = """
-        <style>
+        html = """<style>
             .lora-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; max-height: 600px; overflow-y: auto; padding: 4px; }
-            .lora-item { 
-                background: #252630; 
-                border-radius: 6px; 
-                overflow: hidden; 
-                border: 2px solid transparent; 
-                cursor: pointer; 
-                position: relative; 
-                transition: all 0.2s; 
-                aspect-ratio: 1; 
-            }
+            .lora-item { background: #252630; border-radius: 6px; overflow: hidden; border: 2px solid transparent; cursor: pointer; position: relative; transition: all 0.2s; aspect-ratio: 1; }
             .lora-item:hover { border-color: #4dabf7; }
             .lora-item.selected { border-color: #4dabf7; box-shadow: 0 0 0 2px rgba(77, 171, 247, 0.4); }
-            
             .lora-thumb { width: 100%; height: 100%; object-fit: cover; background: #111; display: block; }
-            
-            .lora-name { 
-                position: absolute;
-                bottom: 0;
-                left: 0;
-                width: 100%;
-                background: rgba(0, 0, 0, 0.7);
-                color: white !important;
-                padding: 4px 6px;
-                font-size: 11px;
-                line-height: 1.2;
-                font-weight: 600;
-                text-shadow: none;
-                z-index: 5;
-                box-sizing: border-box;
-                word-break: break-all;
-                pointer-events: none;
-                -webkit-font-smoothing: antialiased;
-            }
-            
-            .lora-check { 
-                position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; 
-                border-radius: 50%; background: #4dabf7; display: none; 
-                align-items: center; justify-content: center; color: white; 
-                font-size: 12px; font-weight: bold; z-index: 10; 
-                box-shadow: 0 2px 4px rgba(0,0,0,0.3); 
-            }
+            .lora-name { position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(0, 0, 0, 0.7); color: white !important; padding: 4px 6px; font-size: 11px; line-height: 1.2; font-weight: 600; text-shadow: none; z-index: 5; box-sizing: border-box; word-break: break-all; pointer-events: none; -webkit-font-smoothing: antialiased; }
+            .lora-check { position: absolute; top: 4px; right: 4px; width: 18px; height: 18px; border-radius: 50%; background: #4dabf7; display: none; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold; z-index: 10; box-shadow: 0 2px 4px rgba(0,0,0,0.3); }
             .lora-item.selected .lora-check { display: flex; }
-        </style>
-        <div class="lora-grid">
-        """
+        </style><div class="lora-grid">"""
         
         for f in files:
             full_path = os.path.join(self.lora_root, f if category == "All LoRAs" else os.path.join(category, f))
-            json_path = self.get_sidecar_json_path(full_path)
-            
+            json_path = self.get_civitai_json_path(full_path)
             model_id = None
             if os.path.exists(json_path):
                 try:
@@ -640,34 +642,20 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 except: pass
             
             _, img_path = self.get_local_preview_path(model_id)
-            
             is_video = img_path and (img_path.endswith('.mp4') or img_path.endswith('.webm'))
             img_content = ""
-            
             if img_path:
-                if is_video:
-                    img_content = f'<video src="{img_path}" class="lora-thumb" autoplay loop muted playsinline></video>'
-                else:
-                    img_content = f'<img src="{img_path}" class="lora-thumb" loading="lazy">'
-            else:
-                img_content = f'<img src="{PLACEHOLDER_B64}" class="lora-thumb" loading="lazy">'
+                if is_video: img_content = f'<video src="{img_path}" class="lora-thumb" autoplay loop muted playsinline></video>'
+                else: img_content = f'<img src="{img_path}" class="lora-thumb" loading="lazy">'
+            else: img_content = f'<img src="{PLACEHOLDER_B64}" class="lora-thumb" loading="lazy">'
             
             is_sel = f in selected_list
             sel_class = "selected" if is_sel else ""
             f_esc = f.replace("'", "\\'")
-            
-            html += f"""
-            <div class="lora-item {sel_class}" onclick="toggleLoraCard(this, '{f_esc}')">
-                <div class="lora-check">✓</div>
-                {img_content}
-                <div class="lora-name">{os.path.basename(f)}</div>
-            </div>
-            """
-            
+            html += f"""<div class="lora-item {sel_class}" onclick="toggleLoraCard(this, '{f_esc}')"><div class="lora-check">✓</div>{img_content}<div class="lora-name">{os.path.basename(f)}</div></div>"""
         html += "</div>"
         return html
 
-    
     def ui_refresh_click(self, state, sel, selected_list):
         _, dd, html = self.force_refresh(state, sel, selected_list)
         return dd, html
@@ -687,7 +675,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 tf = os.path.basename(td)
                 if tf in [c[1] for c in choices]: val = tf
             except: pass
-        
         return True, gr.update(choices=choices, value=val), self.render_lora_grid(state, val, selected_list or [])
 
     def run_search(self, q, s, p, t, b, n, k):
@@ -738,101 +725,19 @@ class LoraManagerPlugin(WAN2GPPlugin):
         if not items:
             return "<div style='color:#888; padding:20px; text-align:center; font-size:1.2em;'>No models found.</div>"
 
-        html = """
-        <style>
-            .civit-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-                gap: 16px;
-                padding: 10px;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            }
-            .civit-card {
-                background-color: #252630;
-                border-radius: 12px;
-                overflow: hidden;
-                position: relative;
-                padding-top: 150%; 
-                cursor: pointer;
-                border: 1px solid #373a40;
-                transition: transform 0.2s;
-                box-sizing: border-box;
-            }
-            .civit-card:hover {
-                transform: translateY(-4px);
-                border-color: #4dabf7;
-                box-shadow: 0 10px 20px rgba(0,0,0,0.5);
-            }
-            .civit-media-container {
-                position: absolute;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: #101113;
-                z-index: 1;
-            }
-            .civit-media {
-                width: 100% !important;
-                height: 100% !important;
-                object-fit: cover !important;
-                display: block;
-            }
-            .civit-overlay {
-                position: absolute;
-                bottom: 0;
-                left: 0;
-                right: 0;
-                background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 60%, transparent 100%);
-                padding: 50px 12px 12px 12px;
-                pointer-events: none;
-                z-index: 2;
-            }
-            .civit-title {
-                color: #ffffff !important;
-                font-weight: 700;
-                font-size: 1rem;
-                line-height: 1.3;
-                text-shadow: 0 2px 3px rgba(0,0,0,1);
-                margin-bottom: 6px;
-                display: -webkit-box;
-                -webkit-line-clamp: 3;
-                -webkit-box-orient: vertical;
-                overflow: hidden;
-            }
-            .civit-meta {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                font-size: 0.8rem;
-            }
-            .civit-badge {
-                background: rgba(34, 139, 230, 0.9);
-                color: #fff;
-                padding: 3px 6px;
-                border-radius: 4px;
-                font-size: 0.75rem;
-                font-weight: 500;
-            }
-        </style>
-        <div class="civit-grid">
-        """
+        html = """<style>.civit-grid {display: grid;grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));gap: 16px;padding: 10px;font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;}.civit-card {background-color: #252630;border-radius: 12px;overflow: hidden;position: relative;padding-top: 150%;cursor: pointer;border: 1px solid #373a40;transition: transform 0.2s;box-sizing: border-box;}.civit-card:hover {transform: translateY(-4px);border-color: #4dabf7;box-shadow: 0 10px 20px rgba(0,0,0,0.5);}.civit-media-container {position: absolute;top: 0;left: 0;width: 100%;height: 100%;background: #101113;z-index: 1;}.civit-media {width: 100% !important;height: 100% !important;object-fit: cover !important;display: block;}.civit-overlay {position: absolute;bottom: 0;left: 0;right: 0;background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 60%, transparent 100%);padding: 50px 12px 12px 12px;pointer-events: none;z-index: 2;}.civit-title {color: #ffffff !important;font-weight: 700;font-size: 1rem;line-height: 1.3;text-shadow: 0 2px 3px rgba(0,0,0,1);margin-bottom: 6px;display: -webkit-box;-webkit-line-clamp: 3;-webkit-box-orient: vertical;overflow: hidden;}.civit-meta {display: flex;justify-content: space-between;align-items: center;font-size: 0.8rem;}.civit-badge {background: rgba(34, 139, 230, 0.9);color: #fff;padding: 3px 6px;border-radius: 4px;font-size: 0.75rem;font-weight: 500;}</style><div class="civit-grid">"""
 
         for item in items:
             mid = item.get('id')
             name = item.get('name', 'Unknown').replace('"', '&quot;')
-            
             rank = item.get('rank', {}) or {}
             stats = item.get('stats', {}) or {}
             thumbs = rank.get('thumbsUpCount', stats.get('favoriteCount', stats.get('thumbsUpCount', 0))) or 0
             dls = rank.get('downloadCount', stats.get('downloadCount', 0)) or 0
             dls_str = f"{dls/1000:.1f}k" if dls > 1000 else str(dls)
-            
             mtype = item.get('type', 'Model')
-
             media_html = ""
             poster_src = ""
-            
             imgs = item.get('images', [])
             if not imgs and 'version' in item: imgs = item['version'].get('images', [])
             if not imgs and 'modelVersions' in item and item['modelVersions']: imgs = item['modelVersions'][0].get('images', [])
@@ -841,53 +746,34 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 first = imgs[0]
                 url = first.get('url')
                 is_vid = first.get('type') == 'video' or (url and (url.endswith('.mp4') or url.endswith('.webm')))
-                
                 src = ""
                 if url:
                     if "http" not in url:
                         src = self.construct_media_url(url, 450, is_vid)
-                        if is_vid:
-                            poster_src = self.construct_media_url(url, 450, False)
+                        if is_vid: poster_src = self.construct_media_url(url, 450, False)
                     else:
                         src = url
-                        if is_vid:
-                            poster_src = src.replace('.mp4', '.jpg').replace('.webm', '.jpg')
+                        if is_vid: poster_src = src.replace('.mp4', '.jpg').replace('.webm', '.jpg')
 
                 if is_vid:
                     media_html = f'<video class="civit-media" src="{src}" poster="{poster_src}" autoplay loop muted playsinline preload="auto"></video>'
                 else:
                     _, local_url = self.get_local_preview_path(mid)
-                    if local_url:
-                        media_html = f'<img class="civit-media" src="{local_url}" loading="lazy" alt="preview">'
-                    else:
-                        media_html = f'<img class="civit-media" src="{src}" loading="lazy" alt="preview">'
+                    if local_url: media_html = f'<img class="civit-media" src="{local_url}" loading="lazy" alt="preview">'
+                    else: media_html = f'<img class="civit-media" src="{src}" loading="lazy" alt="preview">'
             else:
                 media_html = '<div class="civit-media" style="display:flex;align-items:center;justify-content:center;color:#666;background:#222;">No Preview</div>'
 
-            html += f"""
-            <div class="civit-card" onclick="window.civitSelectCard({mid})">
-                <div class="civit-media-container">{media_html}</div>
-                <div class="civit-overlay">
-                    <div class="civit-title">{name}</div>
-                    <div class="civit-meta">
-                        <span class="civit-badge">{mtype}</span>
-                        <span style="color: #ffffff; text-shadow: 0 1px 3px rgba(0,0,0,1); font-weight: 600;">👍 {thumbs} · ⬇ {dls_str}</span>
-                    </div>
-                </div>
-            </div>
-            """
+            html += f"""<div class="civit-card" onclick="window.civitSelectCard({mid})"><div class="civit-media-container">{media_html}</div><div class="civit-overlay"><div class="civit-title">{name}</div><div class="civit-meta"><span class="civit-badge">{mtype}</span><span style="color: #ffffff; text-shadow: 0 1px 3px rgba(0,0,0,1); font-weight: 600;">👍 {thumbs} · ⬇ {dls_str}</span></div></div></div>"""
 
         html += "</div>"
         return html
 
     def on_select_model(self, model_id_str, current_items, api_key):
         if not model_id_str:
-            return gr.update(), "", gr.update(), {}, "Ready"
-        
-        try:
-            mid = int(model_id_str)
-        except:
-            return gr.update(), "", gr.update(), {}, "Invalid ID"
+            return gr.update(), "", gr.update(), {}, "Ready", gr.update(value="loras")
+        try: mid = int(model_id_str)
+        except: return gr.update(), "", gr.update(), {}, "Invalid ID", gr.update()
 
         preview = next((x for x in (current_items or []) if x.get('id') == mid), {})
         full_data = preview
@@ -901,73 +787,32 @@ class LoraManagerPlugin(WAN2GPPlugin):
         desc = full_data.get('description', 'No description.')
         tags = ", ".join(full_data.get('tags', []))
         
-        info_html = f"""
-        <style>
-            .civit-details-box {{
-                background-color: #1f2937; 
-                color: #ffffff !important; 
-                padding: 20px; 
-                border-radius: 12px; 
-                border: 1px solid #374151;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            }}
-            /* Force all children to be white/light */
-            .civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; }}
-            .civit-details-box p, 
-            .civit-details-box li, 
-            .civit-details-box span, 
-            .civit-details-box div {{ 
-                color: #e5e7eb !important; 
-                line-height: 1.6;
-            }}
-            .civit-details-box a {{ color: #60a5fa !important; text-decoration: underline; }}
-            .civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }}
+        versions = full_data.get('modelVersions', [])
+        base_model = "Unknown"
+        if versions: base_model = versions[0].get('baseModel', 'Unknown')
+        elif 'version' in full_data: base_model = full_data['version'].get('baseModel', 'Unknown')
             
-            /* Badge styling for Properties */
-            .civit-badge-prop {{
-                background-color: #374151 !important;
-                color: #ffffff !important;
-                padding: 6px 10px;
-                border-radius: 6px;
-                display: inline-block;
-                font-size: 0.9em;
-                margin-right: 8px;
-                margin-bottom: 8px;
-                border: 1px solid #4b5563;
-            }}
-        </style>
-        
-        <div class="civit-details-box">
-            <h1>{name}</h1>
-            
-            <div style="margin-bottom: 20px;">
-                <span class="civit-badge-prop">🛠 <b>{creator}</b></span>
-                <span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span>
-                <span class="civit-badge-prop">🏷 {tags}</span>
-            </div>
-            
-            <hr style="border-top: 1px solid #4a4d55; margin-bottom: 20px;">
-            
-            <div>
-                {desc}
-            </div>
-        </div>
-        """
+        target_path = self.resolve_target_folder(base_model)
+
+        info_html = f"""<style>.civit-details-box {{background-color: #1f2937; color: #ffffff !important; padding: 20px; border-radius: 12px; border: 1px solid #374151; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;}}.civit-details-box h1 {{ color: #ffffff !important; margin-top: 0; line-height: 1.2; font-size: 1.8em; }}.civit-details-box p, .civit-details-box li, .civit-details-box span, .civit-details-box div {{ color: #e5e7eb !important; line-height: 1.6;}}.civit-details-box a {{ color: #60a5fa !important; text-decoration: underline; }}.civit-details-box strong, .civit-details-box b {{ color: #ffffff !important; font-weight: 700; }}.civit-badge-prop {{background-color: #374151 !important;color: #ffffff !important;padding: 6px 10px;border-radius: 6px;display: inline-block;font-size: 0.9em;margin-right: 8px;margin-bottom: 8px;border: 1px solid #4b5563;}}</style><div class="civit-details-box"><h1>{name}</h1><div style="margin-bottom: 20px;"><span class="civit-badge-prop">🛠 <b>{creator}</b></span><span class="civit-badge-prop">📦 <b>{full_data.get('type')}</b></span><span class="civit-badge-prop">🧩 <b>{base_model}</b></span><span class="civit-badge-prop">🏷 {tags}</span></div><hr style="border-top: 1px solid #4a4d55; margin-bottom: 20px;"><div>{desc}</div></div>"""
         
         versions = full_data.get('modelVersions', [])
         if not versions and 'version' in full_data: versions = [full_data['version']]
         ver_choices = [(f"{v['name']} ({v.get('baseModel','?')})", v['id']) for v in versions]
         first_ver = ver_choices[0][1] if ver_choices else None
         
-        return gr.Tabs(selected="details_tab"), info_html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}"
+        return gr.Tabs(selected="details_tab"), info_html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}", target_path
 
     def update_version_files(self, version_id, model_data):
-        if not model_data or not version_id: return gr.update(choices=[]), ""
+        if not model_data or not version_id: return gr.update(choices=[]), "", gr.update()
         versions = model_data.get('modelVersions', [])
         if not versions and 'version' in model_data: versions = [model_data['version']]
         version = next((v for v in versions if v['id'] == version_id), None)
-        if not version: return gr.update(choices=[]), "Version info missing"
-        
+        if not version: return gr.update(choices=[]), "Version info missing", gr.update()
+
+        base_model = version.get('baseModel', 'Unknown')
+        new_target_folder = self.resolve_target_folder(base_model)
+
         file_opts = []
         for f in version.get('files', []):
             label = f"{f.get('type','Model')} | {f['name']} | {round(f.get('sizeKB',0)/1024, 2)} MB"
@@ -996,30 +841,95 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 media_html += f"<div style='{cell_style}'><img src='{src}' loading='lazy' style='{media_style}'></div>"
         media_html += "</div>"
         
-        return gr.update(choices=file_opts, value=file_opts[0][1] if file_opts else None), media_html
+        return gr.update(choices=file_opts, value=file_opts[0][1] if file_opts else None), media_html, new_target_folder
 
-    def download_model(self, url, key, state, model_data):
+    def download_model(self, url, key, state, model_data, target_dir_input):
         if not url: return "No file selected"
-        target_dir = self.discover_lora_root(state)
-        if not os.path.exists(target_dir): os.makedirs(target_dir, exist_ok=True)
+        
+        model_type = model_data.get('type', '')
+        if model_type == 'Checkpoint':
+            return self.create_finetune_definition(url, model_data)
+
+        target_dir = target_dir_input.strip()
+        if not target_dir: target_dir = "loras"
+        
+        if not os.path.exists(target_dir):
+            try: os.makedirs(target_dir, exist_ok=True)
+            except Exception as e: return f"Error creating directory '{target_dir}': {e}"
+
         try:
             r = requests.get(url, headers=self.get_headers(key), stream=True)
             r.raise_for_status()
+            
             fname = "model.safetensors"
             if "content-disposition" in r.headers and "filename=" in r.headers["content-disposition"]:
                 fname = r.headers["content-disposition"].split("filename=")[1].strip('"').strip(';')
+            else:
+                versions = model_data.get('modelVersions', [])
+                for v in versions:
+                    for f in v.get('files', []):
+                        if f['downloadUrl'] == url:
+                            fname = f['name']
+                            break
+            
             save_path = os.path.join(target_dir, fname)
             with open(save_path, 'wb') as f:
                 for chunk in r.iter_content(1024*1024): f.write(chunk)
 
             mid = model_data.get('id')
             if mid:
-                self._fetch_and_process_single_lora(save_path, fname)
+                self._fetch_and_process_single_lora(save_path)
                 _, local_prev = self.get_local_preview_path(mid)
-                if not local_prev and model_data.get('images'): self.download_preview_image(model_data['images'][0]['url'], mid)
+                if not local_prev and model_data.get('images'): 
+                    self.download_preview_image(model_data['images'][0]['url'], mid)
             
-            return f"Saved to {fname}"
+            return f"Saved to {save_path}"
         except Exception as e: return f"Error: {e}"
+
+    def create_finetune_definition(self, download_url, model_data):
+        civit_base = "Unknown"
+        versions = model_data.get('modelVersions', [])
+        selected_version = None
+        for v in versions:
+            for f in v.get('files', []):
+                if f['downloadUrl'] == download_url:
+                    selected_version = v
+                    break
+            if selected_version: break
+        
+        if not selected_version and versions: selected_version = versions[0]
+        if selected_version: civit_base = selected_version.get('baseModel', 'Unknown')
+        wangp_arch = CIVIT_TO_WANGP_ARCH.get(civit_base)
+        
+        if not wangp_arch:
+            return f"Error: Could not map CivitAI Base Model '{civit_base}' to a WanGP Architecture. Manual download required."
+
+        safe_name = "".join([c for c in model_data.get('name', 'Unknown') if c.isalnum() or c in (' ', '-', '_')]).strip()
+        filename = safe_name.replace(" ", "_") + ".json"
+        save_path = os.path.join(self.finetunes_root, filename)
+        
+        trained_words = selected_version.get('trainedWords', [])
+        prompt_str = ", ".join(trained_words) if trained_words else ""
+        description = f"Imported from CivitAI. Base: {civit_base}. {model_data.get('description', '')[:200]}..."
+        
+        finetune_data = {
+            "settings_version": 2.41,
+            "prompt": prompt_str,
+            "model": {
+                "name": model_data.get('name', 'Unknown'),
+                "architecture": wangp_arch,
+                "description": description,
+                "URLs": [download_url],
+                "auto_quantize": True
+            }
+        }
+        
+        try:
+            with open(save_path, 'w', encoding='utf-8') as f: json.dump(finetune_data, f, indent=4)
+            mid = model_data.get('id')
+            if mid and model_data.get('images'): self.download_preview_image(model_data['images'][0]['url'], mid)
+            return f"Created Finetune Definition: {filename}. Restart WanGP to see it."
+        except Exception as e: return f"Error creating finetune definition: {e}"
 
     def bridge_manager_to_browser(self, mid):
         if not mid: return gr.update(), gr.update(), gr.update()
@@ -1030,29 +940,17 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.has_loaded_once = True
         return self.force_refresh(state, None, None)
 
-    def load_json_db(self):
-        if os.path.exists(self.db_path):
-            try:
-                with open(self.db_path, 'r') as f: self.lora_metadata = json.load(f)
-            except: self.lora_metadata = {}
-        else: self.lora_metadata = {}
-
     def resolve_path(self, item_name):
         is_recursive = os.path.sep in item_name or "/" in item_name
-        if is_recursive: return item_name.replace("\\", "/"), os.path.join(self.lora_root, item_name)
+        if is_recursive: return os.path.join(self.lora_root, item_name)
         for root, _, files in os.walk(self.lora_root):
-            if item_name in files:
-                return os.path.join(os.path.relpath(root, self.lora_root), item_name).replace("\\", "/"), os.path.join(root, item_name)
-        return item_name, ""
+            if item_name in files: return os.path.join(root, item_name)
+        return item_name
 
-    def save_metadata(self, key, prompt):
-        if not key: return
-        if key not in self.lora_metadata: self.lora_metadata[key] = {}
-        self.lora_metadata[key]["prompt"] = prompt
-        try:
-            with open(self.db_path, 'w') as f: json.dump(self.lora_metadata, f, indent=4)
-            gr.Info("Saved!")
-        except Exception as e: gr.Error(f"Error: {e}")
+    def save_lset_prompt(self, full_path, prompt):
+        if not full_path or not os.path.exists(full_path): return
+        self.write_lset(full_path, prompt)
+        gr.Info("Saved to .lset file!")
 
     def discover_lora_root(self, state):
         try: 
@@ -1082,20 +980,47 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 dmap[f] = f"{f} ({mstr})"
         return dmap
 
-    def finalize_injection(self, selected_loras, prompt_mode, lora_mode, current_prompt, current_loras):
-        prompts = []
-        for l in selected_loras:
-            k, _ = self.resolve_path(l)
-            p = self.lora_metadata.get(k, {}).get("prompt", "")
-            if p: prompts.append(p)
+    def update_action_options(self, selected_items):
+        if not selected_items:
+            return gr.update(choices=[], value=[], visible=False), gr.update(choices=[], value=[], visible=False), gr.update(visible=False)
         
-        p_text = ", ".join(prompts)
-        new_prompt = p_text if prompt_mode == "Overwrite" else (f"{current_prompt}\n{p_text}" if current_prompt and p_text else (current_prompt or p_text))
+        all_prompts = []
+        all_loras = set()
         
-        final_loras = [] if lora_mode == "Overwrite" else (current_loras or []).copy()
-        for l in selected_loras:
-            b = os.path.basename(l)
-            if b not in final_loras: final_loras.append(b)
+        for lora in selected_items:
+            all_loras.add(os.path.basename(lora))
+
+            full_path = self.resolve_path(lora)
+            data = self.read_lset_data(full_path)
+
+            p = data.get("prompt", "")
+            if p:
+                if isinstance(p, list): all_prompts.extend([x.strip() for x in p if x.strip()])
+                elif isinstance(p, str) and p.strip(): all_prompts.append(p.strip())
+
+            deps = data.get("loras", [])
+            for d in deps:
+                all_loras.add(os.path.basename(d))
+        
+        unique_prompts = sorted(list(set(all_prompts)))
+        unique_loras = sorted(list(all_loras))
+        
+        return (
+            gr.update(choices=unique_prompts, value=unique_prompts, visible=True), 
+            gr.update(choices=unique_loras, value=unique_loras, visible=True),
+            gr.update(visible=True)
+        )
+
+    def finalize_injection(self, selected_prompts, selected_loras, prompt_mode, lora_mode, current_prompt, current_loras):
+        p_text = ", ".join(selected_prompts) if selected_prompts else ""
+        new_prompt = p_text if prompt_mode == "Overwrite Current Prompts" else (f"{current_prompt}\n{p_text}" if current_prompt and p_text else (current_prompt or p_text))
+
+        final_loras = [] if lora_mode == "Overwrite Current Loras" else (current_loras or []).copy()
+        
+        if selected_loras:
+            for l in selected_loras:
+                if l not in final_loras:
+                    final_loras.append(l)
             
-        gr.Info(f"Injected {len(selected_loras)} LoRAs")
+        gr.Info(f"Injected {len(selected_loras) if selected_loras else 0} LoRAs and {len(selected_prompts) if selected_prompts else 0} prompts")
         return new_prompt, final_loras, self.goto_video_tab(None)
