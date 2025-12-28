@@ -64,7 +64,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "LoRA Manager"
-        self.version = "2.5.3"
+        self.version = "2.5.5"
         self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
         
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
@@ -403,8 +403,10 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.lora_selection_state = gr.State([])
         
         self.manager_to_browser_state = gr.State()
-        self.manager_to_browser_btn = gr.Button(visible=False, elem_id="manager_to_browser_btn")
-        self.lora_selection_bridge = gr.Textbox(elem_id="lora_selection_bridge", visible=False)
+
+        gr.HTML("<style>.plugin-hidden-ui { display: none !important; }</style>")
+        self.manager_to_browser_btn = gr.Button(visible=True, elem_id="manager_to_browser_btn", elem_classes=["plugin-hidden-ui"])
+        self.lora_selection_bridge = gr.Textbox(elem_id="lora_selection_bridge", visible=True, elem_classes=["plugin-hidden-ui"])
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -438,6 +440,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                         choices=["Image Thumbnail (First Frame)", "Original Media (Video/Image)"],
                         value=self.saved_settings.get("preview_mode", "Image Thumbnail (First Frame)")
                     )
+                    self.save_settings_btn = gr.Button("💾 Save Settings", size="sm")
 
             with gr.Column(scale=2):
                 @gr.render(inputs=[self.lora_selection_state, self.refresh_trigger, self.auto_fetch_chk], triggers=[self.lora_selection_state.change, self.refresh_trigger.change])
@@ -525,9 +528,15 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.refresh_btn.click(self.ui_refresh_click, [self.state, self.category_dropdown, self.lora_selection_state], [self.category_dropdown, self.lora_html_list])
         self.update_all_btn.click(self.batch_update_metadata, [self.state, self.category_dropdown, self.lora_selection_state], [self.refresh_trigger])
 
-        self.api_key.change(lambda x: self.save_settings_to_disk(api_key=x), inputs=[self.api_key], outputs=None)
-        self.auto_fetch_chk.change(lambda x: self.save_settings_to_disk(auto_fetch=x), inputs=[self.auto_fetch_chk], outputs=None)
-        self.preview_mode.change(lambda x: self.save_settings_to_disk(preview_mode=x), inputs=[self.preview_mode], outputs=None)
+        def save_manager_settings(key, auto, mode):
+            self.save_settings_to_disk(api_key=key, auto_fetch=auto, preview_mode=mode)
+            gr.Info("Settings saved!")
+
+        self.save_settings_btn.click(
+            save_manager_settings, 
+            inputs=[self.api_key, self.auto_fetch_chk, self.preview_mode], 
+            outputs=None
+        )
 
         self.lora_selection_bridge.change(fn=lambda x: json.loads(x) if x else [], inputs=[self.lora_selection_bridge], outputs=[self.lora_selection_state])
 
@@ -548,8 +557,8 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.civit_cursor = gr.State(None)
         self.civit_model_data = gr.State({})
 
-        self.bridge_input = gr.Textbox(elem_id="civit_bridge_input", visible=False)
-        self.load_more_btn = gr.Button("Load More", elem_id="civit_load_more_btn", visible=False)
+        self.bridge_input = gr.Textbox(elem_id="civit_bridge_input", visible=True, elem_classes=["plugin-hidden-ui"])
+        self.load_more_btn = gr.Button("Load More", elem_id="civit_load_more_btn", visible=True, elem_classes=["plugin-hidden-ui"])
         self.browser_bridge_trigger = gr.Button(visible=False) 
 
         d_sort = self.saved_settings.get("sort", "Highest Rated")
