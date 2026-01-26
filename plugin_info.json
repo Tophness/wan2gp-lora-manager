@@ -1,0 +1,8 @@
+{
+  "name": "LoRA Manager",
+  "author": "Tophness",
+  "version": "2.5.5",
+  "description": "Manage local LoRAs with lset support and granular prompt/file injection.",
+  "date": "",
+  "wan2gp_version": ""
+}
