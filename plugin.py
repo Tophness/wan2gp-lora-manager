@@ -62,11 +62,7 @@ PLACEHOLDER_B64 = f"data:image/svg+xml;base64,{base64.b64encode(PLACEHOLDER_SVG.
 
 class LoraManagerPlugin(WAN2GPPlugin):
     def __init__(self):
-        super().__init__()
-        self.name = "LoRA Manager"
-        self.version = "2.5.5"
-        self.description = "Manage local LoRAs with lset support and granular prompt/file injection."
-        
+        super().__init__()      
         self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
         self.lora_root = "loras" 
         self.finetunes_root = "finetunes"
@@ -1127,3 +1123,4 @@ class LoraManagerPlugin(WAN2GPPlugin):
             
         gr.Info(f"Injected {len(selected_loras) if selected_loras else 0} LoRAs and {len(selected_prompts) if selected_prompts else 0} prompts")
         return new_prompt, final_loras, self.goto_video_tab(None)
+
