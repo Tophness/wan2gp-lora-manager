@@ -8,11 +8,25 @@ import shutil
 import tempfile
 import cv2
 import base64
+import traceback
 from shared.utils.plugins import WAN2GPPlugin
 
 CIVITAI_HOST = "https://civitai.com"
-TRPC_URL = "https://civitai.com/api/trpc/model.getAll"
-REST_URL = "https://civitai.com/api/v1/models"
+CIVITAI_SOURCES = ["civitai.com", "civitai.red"]
+CIVITAI_HOSTS = {
+    "civitai.com": "https://civitai.com",
+    "civitai.red": "https://civitai.red",
+}
+FALLBACK_SEARCH_TARGET_RESULTS = 20
+FALLBACK_BROWSE_MAX_PAGES = 10
+FALLBACK_GLOBAL_MAX_PAGES = 10
+FALLBACK_CURSOR_PREFIX = "__fallback__:"
+REQUEST_TIMEOUT = 30
+TRPC_PATH = "/api/trpc/model.getAll"
+REST_PATH = "/api/v1/models"
+MODEL_VERSION_BY_HASH_PATH = "/api/v1/model-versions/by-hash"
+TRPC_URL = f"{CIVITAI_HOST}{TRPC_PATH}"
+REST_URL = f"{CIVITAI_HOST}{REST_PATH}"
 IMAGE_BASE_URL = "https://imagecache.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -41,8 +55,8 @@ CIVIT_TO_WANGP_ARCH = {
     "Wan Video 1.3B t2v": "t2v_1.3B",
     "Wan Video 14B i2v 480p": "i2v",
     "Wan Video 14B i2v 720p": "i2v",
-    "Wan Video 2.2 T2V-A14B": "t2v",
-    "Wan Video 2.2 I2V-A14B": "t2v",
+    "Wan Video 2.2 T2V-A14B": "t2v_2_2",
+    "Wan Video 2.2 I2V-A14B": "i2v_2_2",
     "Wan Video 2.2 TI2V-5B": "ti2v_2_2",
     "Hunyuan Video": "hunyuan_1_5_t2v",
     "Hunyuan 1": "hunyuan",
@@ -181,15 +195,185 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 json.dump(self.saved_settings, f, indent=4)
         except Exception as e: print(f"Error saving settings: {e}")
 
-    def get_headers(self, api_key: str = "") -> dict:
+    def get_civitai_host(self, source: str = None) -> str:
+        source = (source or self.saved_settings.get("source") or CIVITAI_SOURCES[0])
+        source = str(source).strip()
+        if source.startswith(("http://", "https://")):
+            return source.rstrip("/")
+        return CIVITAI_HOSTS.get(source.lower(), CIVITAI_HOST)
+
+    def get_civitai_rest_url(self, source: str = None) -> str:
+        return f"{self.get_civitai_host(source)}{REST_PATH}"
+
+    def get_civitai_trpc_url(self, source: str = None) -> str:
+        return f"{self.get_civitai_host(source)}{TRPC_PATH}"
+
+    def get_headers(self, api_key: str = "", source: str = None) -> dict:
+        host = self.get_civitai_host(source)
         headers = {
             "User-Agent": USER_AGENT,
             "Content-Type": "application/json",
-            "Referer": "https://civitai.com/models"
+            "Referer": f"{host}/models"
         }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
+
+    def version_matches_base(self, version, base_models):
+        if not base_models:
+            return True
+        return version and version.get("baseModel") in base_models
+
+    def item_matches_base(self, item, base_models):
+        if not base_models:
+            return True
+        versions = []
+        if item.get("version"):
+            versions.append(item["version"])
+        versions.extend(item.get("modelVersions") or [])
+        return any(self.version_matches_base(v, base_models) for v in versions)
+
+    def filter_items_by_base(self, items, base_models):
+        if not base_models:
+            return items
+        return [item for item in items if self.item_matches_base(item, base_models)]
+
+    def filter_model_versions_by_base(self, model_data, base_models):
+        if not model_data or not base_models:
+            return model_data
+        versions = model_data.get("modelVersions") or []
+        filtered = [v for v in versions if self.version_matches_base(v, base_models)]
+        model_data = dict(model_data)
+        model_data["modelVersions"] = filtered
+        return model_data
+
+    def item_matches_query(self, item, query):
+        terms = [x for x in (query or "").lower().split() if x]
+        if not terms:
+            return True
+
+        parts = [
+            item.get("name"),
+            item.get("description"),
+            item.get("type"),
+            " ".join(map(str, item.get("tags") or [])),
+        ]
+        creator = item.get("creator") or item.get("user") or {}
+        if isinstance(creator, dict):
+            parts.append(creator.get("username") or creator.get("name"))
+
+        versions = []
+        if item.get("version"):
+            versions.append(item["version"])
+        versions.extend(item.get("modelVersions") or [])
+        for version in versions:
+            parts.extend([
+                version.get("name"),
+                version.get("description"),
+                version.get("baseModel"),
+                " ".join(map(str, version.get("trainedWords") or [])),
+            ])
+
+        haystack = " ".join(str(part) for part in parts if part).lower()
+        return all(term in haystack for term in terms)
+
+    def filter_items_by_query(self, items, query):
+        if not query or not query.strip():
+            return items
+        return [item for item in items if self.item_matches_query(item, query)]
+
+    def item_key(self, item):
+        return str(item.get("id") or item.get("name") or id(item))
+
+    def add_unique_items(self, target, seen, items):
+        for item in items:
+            key = self.item_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            target.append(item)
+
+    def encode_fallback_cursor(self, state):
+        if state.get("browse_done") and state.get("global_done"):
+            return None
+        return FALLBACK_CURSOR_PREFIX + json.dumps(state, separators=(",", ":"))
+
+    def decode_fallback_cursor(self, cursor):
+        if not isinstance(cursor, str) or not cursor.startswith(FALLBACK_CURSOR_PREFIX):
+            return None
+        try:
+            return json.loads(cursor[len(FALLBACK_CURSOR_PREFIX):])
+        except Exception:
+            return None
+
+    def rest_search_page(self, query, source, sort, period, types, base_models, nsfw, key, cursor, limit=20):
+        params = [
+            ("query", query),
+            ("limit", limit),
+            ("sort", sort),
+            ("period", period),
+            ("nsfw", "true" if nsfw else "false"),
+        ]
+        for model_type in (types or []):
+            params.append(("types", model_type))
+        for base_model in (base_models or []):
+            params.append(("baseModels", base_model))
+        if cursor:
+            params.append(("cursor", cursor))
+
+        r = requests.get(self.get_civitai_rest_url(source), headers=self.get_headers(key, source), params=params, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        meta = data.get("metadata", {})
+        next_cursor = meta.get("nextCursor")
+        if not next_cursor and meta.get("nextPage") and "cursor=" in meta["nextPage"]:
+            try: next_cursor = meta["nextPage"].split("cursor=")[1].split("&")[0]
+            except: pass
+        return data.get("items", []), next_cursor
+
+    def fallback_search_from_browse(self, query, source, sort, period, types, base_models, nsfw, key, cursor, reason="Civitai search overloaded"):
+        state = self.decode_fallback_cursor(cursor) or {
+            "browse_cursor": None,
+            "global_cursor": None,
+            "browse_done": False,
+            "global_done": False,
+        }
+        collected = []
+        seen = set()
+        browsed = 0
+        searched = 0
+
+        for _ in range(FALLBACK_BROWSE_MAX_PAGES):
+            if state["browse_done"] or len(collected) >= FALLBACK_SEARCH_TARGET_RESULTS:
+                break
+            page_items, next_cursor, msg = self.browse_trpc(source, sort, period, types, base_models, nsfw, key, state["browse_cursor"])
+            if msg.startswith("Error:"):
+                state["browse_done"] = True
+                break
+            browsed += len(page_items)
+            self.add_unique_items(collected, seen, self.filter_items_by_query(page_items, query))
+            state["browse_cursor"] = next_cursor
+            if not next_cursor:
+                state["browse_done"] = True
+                break
+
+        for _ in range(FALLBACK_GLOBAL_MAX_PAGES):
+            if state["global_done"] or len(collected) >= FALLBACK_SEARCH_TARGET_RESULTS:
+                break
+            try:
+                page_items, next_cursor = self.rest_search_page(query, source, sort, period, types, [], nsfw, key, state["global_cursor"], limit=100)
+            except Exception:
+                state["global_done"] = True
+                break
+            searched += len(page_items)
+            self.add_unique_items(collected, seen, self.filter_items_by_base(page_items, base_models))
+            state["global_cursor"] = next_cursor
+            if not next_cursor:
+                state["global_done"] = True
+                break
+
+        next_cursor = self.encode_fallback_cursor(state)
+        return collected, next_cursor, f"Search {source}: {len(collected)} fallback matches from {browsed} base items and {searched} query items ({reason})"
 
     def construct_media_url(self, uuid: str, width: int = 450, is_video: bool = False) -> str:
         filename = "preview.mp4" if is_video else "preview.jpg"
@@ -251,12 +435,20 @@ class LoraManagerPlugin(WAN2GPPlugin):
     def fetch_civitai_data_by_hash(self, file_path):
         try:
             file_hash = self.generate_hash(file_path)
-            url = f"https://civitai.com/api/v1/model-versions/by-hash/{file_hash}"
-            r = requests.get(url, headers=self.get_headers())
-            if r.status_code != 200: return None, f"HTTP Error: {r.status_code}"
-            data = r.json()
-            if 'error' in data: return None, f"CivitAI Error: {data.get('error')}"
-            return data, None
+            last_error = None
+            for source in CIVITAI_SOURCES:
+                host = self.get_civitai_host(source)
+                url = f"{host}{MODEL_VERSION_BY_HASH_PATH}/{file_hash}"
+                r = requests.get(url, headers=self.get_headers(source=source))
+                if r.status_code != 200:
+                    last_error = f"{source}: HTTP Error {r.status_code}"
+                    continue
+                data = r.json()
+                if 'error' in data:
+                    last_error = f"{source}: CivitAI Error {data.get('error')}"
+                    continue
+                return data, None
+            return None, last_error or "CivitAI metadata not found"
         except Exception as e: return None, str(e)
 
     def get_civitai_json_path(self, lora_full_path):
@@ -319,13 +511,15 @@ class LoraManagerPlugin(WAN2GPPlugin):
             img_url = data['images'][0].get('url')
         elif mid:
              try:
-                 r = requests.get(f"{REST_URL}/{mid}", headers=self.get_headers())
-                 if r.status_code == 200:
-                     mdata = r.json()
-                     ver = next((v for v in mdata.get('modelVersions',[]) if v['id'] == data.get('id')), None)
-                     if ver and ver.get('images'): img_url = ver['images'][0]['url']
-                     elif mdata.get('modelVersions') and mdata['modelVersions'][0].get('images'):
-                         img_url = mdata['modelVersions'][0]['images'][0]['url']
+                 for source in CIVITAI_SOURCES:
+                     r = requests.get(f"{self.get_civitai_rest_url(source)}/{mid}", headers=self.get_headers(source=source))
+                     if r.status_code == 200:
+                         mdata = r.json()
+                         ver = next((v for v in mdata.get('modelVersions',[]) if v['id'] == data.get('id')), None)
+                         if ver and ver.get('images'): img_url = ver['images'][0]['url']
+                         elif mdata.get('modelVersions') and mdata['modelVersions'][0].get('images'):
+                             img_url = mdata['modelVersions'][0]['images'][0]['url']
+                         if img_url: break
              except: pass
         
         if mid and img_url: self.download_preview_image(img_url, mid)
@@ -562,6 +756,9 @@ class LoraManagerPlugin(WAN2GPPlugin):
         d_nsfw = self.saved_settings.get("nsfw", True)
         d_types = self.saved_settings.get("types", ["Checkpoint", "LORA"])
         d_base = self.saved_settings.get("base", DEFAULT_BASE_SELECTION)
+        d_source = self.saved_settings.get("source", CIVITAI_SOURCES[0])
+        if d_source not in CIVITAI_SOURCES:
+            d_source = CIVITAI_SOURCES[0]
 
         with gr.Tabs() as self.civit_tabs:
             with gr.Tab("Browse", id="browse_tab"):
@@ -569,6 +766,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                     with gr.Column(scale=1, min_width=250):
                         self.query = gr.Textbox(label="Search", placeholder="Search models...")
                         with gr.Accordion("Filters", open=True):
+                            self.source = gr.Dropdown(CIVITAI_SOURCES, value=d_source, label="Source")
                             self.sort = gr.Dropdown(SORT_OPTIONS, value=d_sort, label="Sort")
                             self.period = gr.Dropdown(PERIOD_OPTIONS, value=d_period, label="Period")
                             self.nsfw = gr.Checkbox(label="NSFW", value=d_nsfw)
@@ -594,20 +792,20 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
         self.manager_to_browser_btn.click(self.bridge_manager_to_browser, inputs=[self.manager_to_browser_state], outputs=[self.main_tabs, self.bridge_input, self.browser_bridge_trigger])
 
-        def save_browser_settings(sort, period, nsfw, types, base):
-            self.save_settings_to_disk(sort=sort, period=period, nsfw=nsfw, types=types, base=base)
-        
-        save_inputs = [self.sort, self.period, self.nsfw, self.types, self.base]
+        def save_browser_settings(source, sort, period, nsfw, types, base):
+            self.save_settings_to_disk(source=source, sort=sort, period=period, nsfw=nsfw, types=types, base=base)
+
+        save_inputs = [self.source, self.sort, self.period, self.nsfw, self.types, self.base]
         for comp in save_inputs:
             comp.change(save_browser_settings, inputs=save_inputs, outputs=None)
 
-        self.search_btn.click(self.run_search, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key], [self.html_results, self.civit_items, self.civit_cursor, self.status])
-        self.load_more_btn.click(self.run_more, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key, self.civit_cursor, self.civit_items], [self.html_results, self.civit_items, self.civit_cursor, self.status])
-        self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status, self.target_folder]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
+        self.search_btn.click(self.run_search, [self.query, self.source, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key], [self.html_results, self.civit_items, self.civit_cursor, self.status])
+        self.load_more_btn.click(self.run_more, [self.query, self.source, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key, self.civit_cursor, self.civit_items], [self.html_results, self.civit_items, self.civit_cursor, self.status])
+        self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key, self.source, self.base], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status, self.target_folder]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
         self.ver_dd.change(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
 
         self.back_btn.click(lambda: gr.Tabs(selected="browse_tab"), None, self.civit_tabs)
-        self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data, self.target_folder], [self.dl_status])
+        self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data, self.target_folder, self.source], [self.dl_status])
         self.search_btn.click()
 
     def render_lora_grid(self, state, category, selected_list):
@@ -686,48 +884,55 @@ class LoraManagerPlugin(WAN2GPPlugin):
             except: pass
         return True, gr.update(choices=choices, value=val), self.render_lora_grid(state, val, selected_list or [])
 
-    def run_search(self, q, s, p, t, b, n, k):
-        items, nxt, msg = self.router_search(q, s, p, t, b, n, k, None)
-        self.items_cache = items 
+    def run_search(self, q, source, s, p, t, b, n, k):
+        items, nxt, msg = self.router_search(q, source, s, p, t, b, n, k, None)
+        self.items_cache = items
         html = self.render_html_grid(items)
         return html, items, nxt, msg
 
-    def run_more(self, q, s, p, t, b, n, k, cur, existing):
+    def run_more(self, q, source, s, p, t, b, n, k, cur, existing):
         if not cur: return gr.update(), existing, cur, "No more pages"
-        new_items, nxt, msg = self.router_search(q, s, p, t, b, n, k, cur)
+        new_items, nxt, msg = self.router_search(q, source, s, p, t, b, n, k, cur)
         combined = existing + new_items
         self.items_cache = combined
         html = self.render_html_grid(combined)
         return html, combined, nxt, msg
 
-    def router_search(self, query, sort, period, types, base, nsfw, key, cursor):
-        if query and query.strip(): return self.search_rest(query, sort, period, nsfw, key, cursor)
-        else: return self.browse_trpc(sort, period, types, base, nsfw, key, cursor)
+    def router_search(self, query, source, sort, period, types, base, nsfw, key, cursor):
+        if query and query.strip(): return self.search_rest(query, source, sort, period, types, base, nsfw, key, cursor)
+        else: return self.browse_trpc(source, sort, period, types, base, nsfw, key, cursor)
 
-    def search_rest(self, query, sort, period, nsfw, key, cursor):
-        params = {"query": query, "limit": 20, "sort": sort, "period": period, "nsfw": "true" if nsfw else "false"}
-        if cursor: params["cursor"] = cursor
+    def search_rest(self, query, source, sort, period, types, base_models, nsfw, key, cursor):
+        if self.decode_fallback_cursor(cursor):
+            return self.fallback_search_from_browse(query, source, sort, period, types, base_models, nsfw, key, cursor, "continuing fallback search")
         try:
-            r = requests.get(REST_URL, headers=self.get_headers(key), params=params)
-            r.raise_for_status()
-            data = r.json()
-            items = data.get("items", [])
-            meta = data.get("metadata", {})
-            next_cursor = meta.get("nextCursor") 
-            if not next_cursor and meta.get("nextPage") and "cursor=" in meta["nextPage"]:
-                try: next_cursor = meta["nextPage"].split("cursor=")[1].split("&")[0]
-                except: pass
-            return items, next_cursor, f"Search: {len(items)} results"
+            raw_items, next_cursor = self.rest_search_page(query, source, sort, period, types, base_models, nsfw, key, cursor, limit=20)
+            items = self.filter_items_by_base(raw_items, base_models)
+            if not items and next_cursor and base_models:
+                return self.fallback_search_from_browse(query, source, sort, period, types, base_models, nsfw, key, cursor, "Civitai search returned an empty cursor page")
+            return items, next_cursor, f"Search {source}: {len(items)} results"
+        except requests.HTTPError as e:
+            response = getattr(e, "response", None)
+            if response is not None and response.status_code in {408, 429, 500, 502, 503, 504}:
+                return self.fallback_search_from_browse(query, source, sort, period, types, base_models, nsfw, key, cursor, f"Civitai search returned HTTP {response.status_code}")
+            return [], None, f"Error: {e}"
+        except requests.RequestException as e:
+            if base_models:
+                return self.fallback_search_from_browse(query, source, sort, period, types, base_models, nsfw, key, cursor, f"Civitai search request failed: {e}")
+            return [], None, f"Error: {e}"
         except Exception as e: return [], None, f"Error: {e}"
 
-    def browse_trpc(self, sort, period, types, base_models, nsfw, key, cursor):
-        input_obj = {"json": {"period": period, "periodMode": "published", "sort": sort, "types": types if types else MODEL_TYPES, "baseModels": base_models if base_models else [], "browsingLevel": 31 if nsfw else 1, "cursor": cursor, "authed": bool(key)}, "meta": {"values": {"cursor": ["undefined"]}}}
+    def browse_trpc(self, source, sort, period, types, base_models, nsfw, key, cursor):
+        input_obj = {"json": {"period": period, "periodMode": "published", "sort": sort, "types": types if types else MODEL_TYPES, "baseModels": base_models if base_models else [], "browsingLevel": 31 if nsfw else 1, "cursor": cursor, "authed": bool(key)}}
+        if cursor is None:
+            input_obj["meta"] = {"values": {"cursor": ["undefined"]}}
         try:
-            r = requests.get(TRPC_URL, headers=self.get_headers(key), params={"input": json.dumps(input_obj)})
+            r = requests.get(self.get_civitai_trpc_url(source), headers=self.get_headers(key, source), params={"input": json.dumps(input_obj)}, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
             data = r.json()
             json_data = data.get("result", {}).get("data", {}).get("json", {})
-            return json_data.get("items", []), json_data.get("nextCursor"), f"Browse: {len(json_data.get('items', []))} items"
+            items = self.filter_items_by_base(json_data.get("items", []), base_models)
+            return items, json_data.get("nextCursor"), f"Browse {source}: {len(items)} items"
         except Exception as e: return [], None, f"Error: {e}"
 
     def render_html_grid(self, items):
@@ -778,20 +983,21 @@ class LoraManagerPlugin(WAN2GPPlugin):
         html += "</div>"
         return html
 
-    def on_select_model(self, model_id_str, current_items, api_key):
+    def on_select_model(self, model_id_str, current_items, api_key, source, base_models):
         if not model_id_str:
             return gr.update(), "", gr.update(), {}, "Ready", gr.update(value="loras")
-        
+
         try: mid = int(model_id_str)
         except: return gr.update(), "", gr.update(), {}, "Invalid ID", gr.update()
 
         preview = next((x for x in (current_items or []) if x.get('id') == mid), {})
         full_data = preview
         try:
-            r = requests.get(f"{REST_URL}/{mid}", headers=self.get_headers(api_key))
+            r = requests.get(f"{self.get_civitai_rest_url(source)}/{mid}", headers=self.get_headers(api_key, source))
             if r.status_code == 200: full_data = r.json()
         except: pass
-        
+        full_data = self.filter_model_versions_by_base(full_data, base_models)
+
         name = full_data.get('name', 'Unknown')
         creator = full_data.get('creator', {}).get('username', 'Unknown')
         desc = full_data.get('description', 'No description.')
@@ -801,6 +1007,9 @@ class LoraManagerPlugin(WAN2GPPlugin):
         if not versions and 'version' in full_data: versions = [full_data['version']]
 
         default_ver = versions[0] if versions else {}
+        if base_models and not versions:
+            return gr.Tabs(selected="details_tab"), "<div style='padding:20px;color:#ddd;'>No versions match the selected base model filter.</div>", gr.update(choices=[], value=None), full_data, "No matching versions", gr.update(value="loras")
+
         is_checkpoint = False
 
         for f in default_ver.get('files', []):
@@ -821,7 +1030,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
         
         ver_choices = [(f"{v['name']} ({v.get('baseModel','?')})", v['id']) for v in versions]
         first_ver = ver_choices[0][1] if ver_choices else None
-        
+
         return gr.Tabs(selected="details_tab"), info_html, gr.update(choices=ver_choices, value=first_ver), full_data, f"Loaded {name}", target_path
 
     def update_version_files(self, version_id, model_data):
@@ -868,7 +1077,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
         
         return gr.update(choices=file_opts, value=file_opts[0][1] if file_opts else None), media_html, new_target_folder
 
-    def download_model(self, url, key, state, model_data, target_dir_input):
+    def download_model(self, url, key, state, model_data, target_dir_input, source=None):
         if not url: return "No file selected"
         is_checkpoint = False
 
@@ -887,7 +1096,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 if found: break
 
         if is_checkpoint:
-            return self.create_finetune_definition(url, model_data, key, target_dir_input)
+            return self.create_finetune_definition(url, model_data, key, target_dir_input, source)
 
         target_dir = target_dir_input.strip()
         if not target_dir: target_dir = "loras"
@@ -899,7 +1108,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 return f"Error creating directory '{target_dir}': {e}"
 
         try:
-            r = requests.get(url, headers=self.get_headers(key), stream=True)
+            r = requests.get(url, headers=self.get_headers(key, source), stream=True)
             r.raise_for_status()
 
             fname = "model.safetensors"
@@ -958,7 +1167,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             traceback.print_exc()
             return f"Error: {e}"
 
-    def create_finetune_definition(self, download_url, model_data, api_key, target_dir=None):
+    def create_finetune_definition(self, download_url, model_data, api_key, target_dir=None, source=None):
         civit_base = "Unknown"
         versions = model_data.get('modelVersions', [])
         selected_version = None
@@ -980,7 +1189,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
         os.makedirs(ckpt_dir, exist_ok=True)
 
         try:
-            r = requests.get(download_url, headers=self.get_headers(api_key), stream=True)
+            r = requests.get(download_url, headers=self.get_headers(api_key, source), stream=True)
             r.raise_for_status()
             
             fname = "model.safetensors"
