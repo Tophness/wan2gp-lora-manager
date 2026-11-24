@@ -1,0 +1,7 @@
+# Runtime files written by the plugin
+settings.json
+civitai_enums_cache.json
+
+# Python
+__pycache__/
+*.py[cod]

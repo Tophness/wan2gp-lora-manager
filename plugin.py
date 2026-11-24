@@ -8,31 +8,45 @@ import shutil
 import tempfile
 import cv2
 import base64
+import re
+import traceback
+import html as html_lib
+from urllib.parse import urlparse, parse_qs
 from shared.utils.plugins import WAN2GPPlugin
 
 CIVITAI_HOST = "https://civitai.com"
-TRPC_URL = "https://civitai.com/api/trpc/model.getAll"
 REST_URL = "https://civitai.com/api/v1/models"
+ENUMS_URL = "https://civitai.com/api/v1/enums"
 IMAGE_BASE_URL = "https://imagecache.civitai.com/xG1nkqKTMzGDvpLrqFT7WA"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-SORT_OPTIONS = ["Highest Rated", "Most Downloaded", "Newest", "Most Liked", "Most Discussed", "Most Collected"]
+# "Relevance" = let CivitAI rank text-search results by match quality (no sort param sent).
+SORT_OPTIONS = ["Relevance", "Highest Rated", "Most Downloaded", "Most Liked", "Most Collected", "Most Discussed", "Newest"]
 PERIOD_OPTIONS = ["AllTime", "Year", "Month", "Week", "Day"]
-MODEL_TYPES = [
-    "Checkpoint", "LORA", "TextualInversion", "Hypernetwork", 
-    "AestheticGradient", "Controlnet", "Poses", "Wildcards", 
-    "Workflows", "MotionModule", "VAE", "Upscaler", "LoCon", "DoRA", "Detection", "Other"
+PAGE_SIZE_OPTIONS = [20, 40, 60, 100]
+THUMB_WIDTH = 450
+
+# Fallback lists, only used if CivitAI's /enums endpoint can't be reached and no cached copy exists.
+# Names must match CivitAI's /api/v1/enums spelling exactly (last synced Nov 2026).
+FALLBACK_MODEL_TYPES = [
+    "Checkpoint", "LORA", "LoCon", "DoRA", "TextualInversion", "Hypernetwork",
+    "AestheticGradient", "Controlnet", "Upscaler", "MotionModule", "VAE",
+    "TextEncoder", "UNet", "CLIPVision", "Poses", "Wildcards", "Workflows",
+    "ComfyWorkflows", "Detection", "Other"
 ]
-BASE_MODELS = [
-    "AuraFlow", "Chroma", "CogVideoX", "Flux.1 S", "Flux.1 D", "Flux.1 Krea",
-    "Flux.1 Kontext", "Flux.2 D", "HiDream", "Hunyuan 1", "Hunyuan Video",
-    "Illustrious", "Kolors", "LTXV", "Lumina", "Mochi", "NoobAI", "Other",
-    "PixArt a", "PixArt E", "Pony", "Pony V7", "Qwen", "SD 1.4", "SD 1.5",
-    "SD 1.5 LCM", "SD 1.5 Hyper", "SD 2.0", "SD 2.1", "SDXL 1.0",
-    "SDXL Lightning", "SDXL Hyper", "Wan Video 1.3B t2v", "Wan Video 14B t2v",
-    "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p", "Wan Video 2.2 TI2V-5B",
-    "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B", "Wan Video 2.5 T2V",
-    "Wan Video 2.5 I2V", "ZImageTurbo"
+FALLBACK_BASE_MODELS = [
+    # Video
+    "Wan Video 1.3B t2v", "Wan Video 14B t2v", "Wan Video 14B i2v 480p", "Wan Video 14B i2v 720p",
+    "Wan Video 2.2 TI2V-5B", "Wan Video 2.2 I2V-A14B", "Wan Video 2.2 T2V-A14B",
+    "Wan Video 2.5 T2V", "Wan Video 2.5 I2V", "Wan Video 2.7", "Wan Video 3.0",
+    "Hunyuan Video", "LTXV", "LTXV2", "LTXV 2.3", "LTXV 2.5", "Flux 3 Video", "CogVideoX", "Mochi",
+    # Image
+    "Flux.1 D", "Flux.1 S", "Flux.1 Krea", "Flux.1 Kontext", "Flux.2 D",
+    "Flux.2 Klein 9B", "Flux.2 Klein 4B", "Flux.3", "Flux.3 Klein",
+    "Qwen", "Qwen 2", "Qwen 2.1", "Qwen 3", "ZImageTurbo", "ZImageBase", "Wan Image 2.7",
+    "Chroma", "HiDream", "Hunyuan 1", "Illustrious", "NoobAI", "Pony", "Pony V7",
+    "SDXL 1.0", "SD 1.5",
+    "Other"
 ]
 DEFAULT_BASE_SELECTION = []
 
@@ -79,8 +93,9 @@ class LoraManagerPlugin(WAN2GPPlugin):
             except: pass
 
         self.saved_settings = {}
-        self.items_cache = []
-        self.cursor_cache = None
+        self.civit_base_models = list(FALLBACK_BASE_MODELS)
+        self.civit_model_types = list(FALLBACK_MODEL_TYPES)
+        self.enums_source = "built-in list"
         self.manager_to_browser_btn = None
         self.manager_to_browser_state = None
         self.civit_tabs = None
@@ -98,8 +113,9 @@ class LoraManagerPlugin(WAN2GPPlugin):
         self.request_component("main_tabs")
         
         self.load_settings()
-        
-        self.on_tab_outputs = [] 
+        self.load_civitai_enums()
+
+        self.on_tab_outputs = []
 
         self.add_custom_js("""
             window.civitSelectCard = function(id) {
@@ -135,18 +151,6 @@ class LoraManagerPlugin(WAN2GPPlugin):
                 textarea.value = JSON.stringify(current);
                 textarea.dispatchEvent(new Event('input', { bubbles: true }));
             }
-
-            let civitScrollTimeout;
-            window.addEventListener('scroll', () => {
-                clearTimeout(civitScrollTimeout);
-                civitScrollTimeout = setTimeout(() => {
-                    const h = document.documentElement;
-                    if ((h.scrollTop + h.clientHeight) > (h.scrollHeight - 500)) {
-                        const btn = document.getElementById('civit_load_more_btn');
-                        if(btn) btn.click();
-                    }
-                }, 150);
-            });
         """)
 
         self.add_tab(
@@ -180,6 +184,42 @@ class LoraManagerPlugin(WAN2GPPlugin):
             with open(self.settings_path, 'w', encoding='utf-8') as f:
                 json.dump(self.saved_settings, f, indent=4)
         except Exception as e: print(f"Error saving settings: {e}")
+
+    def load_civitai_enums(self):
+        """Pull the base model / model type lists from CivitAI once per WanGP start.
+        Falls back to the last successful copy on disk, then to the built-in lists."""
+        cache_path = os.path.join(self.plugin_dir, "civitai_enums_cache.json")
+        data, source = None, None
+        try:
+            r = requests.get(ENUMS_URL, headers=self.get_headers(), timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            source = "CivitAI (live)"
+            try:
+                with open(cache_path, 'w', encoding='utf-8') as f: json.dump(data, f, indent=2)
+            except Exception as e: print(f"[LoRA Manager] Could not cache CivitAI enums: {e}")
+        except Exception as e:
+            print(f"[LoRA Manager] Could not fetch CivitAI base models ({e}); using cached list.")
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f: data = json.load(f)
+                source = "cached copy"
+            except Exception:
+                data = None
+
+        def clean(values):
+            if not isinstance(values, list): return []
+            out = list(dict.fromkeys(v for v in values if isinstance(v, str) and v.strip()))
+            return sorted(out, key=str.lower)
+
+        data = data if isinstance(data, dict) else {}
+        # ActiveBaseModel = what CivitAI's own filter UI offers; BaseModel also includes deprecated ones.
+        bases = clean(data.get("ActiveBaseModel")) or clean(data.get("BaseModel"))
+        types = data.get("ModelType") if isinstance(data.get("ModelType"), list) else []
+        types = [t for t in types if isinstance(t, str) and t.strip()]
+        if bases and types:
+            self.civit_base_models, self.civit_model_types = bases, types
+            self.enums_source = source
+        print(f"[LoRA Manager] {len(self.civit_base_models)} CivitAI base models loaded from {self.enums_source}.")
 
     def get_headers(self, api_key: str = "") -> dict:
         headers = {
@@ -369,7 +409,7 @@ class LoraManagerPlugin(WAN2GPPlugin):
             target_dir = os.path.join(self.lora_root, category)
             if os.path.isdir(target_dir):
                 for f in os.listdir(target_dir):
-                    if f.endswith(".safetensors") or f.endswith(".sft"): files.append(f)
+                    if f.endswith(".safetensors") or f.endswith(".sft"): files_to_process.append(f)
 
         if not files_to_process:
             gr.Warning("No files found to update.")
@@ -550,34 +590,59 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
     def create_browser_ui(self):
         self.civit_items = gr.State([])
-        self.civit_cursor = gr.State(None)
+        self.civit_nav = gr.State({})
         self.civit_model_data = gr.State({})
 
         self.bridge_input = gr.Textbox(elem_id="civit_bridge_input", visible=True, elem_classes=["plugin-hidden-ui"])
-        self.load_more_btn = gr.Button("Load More", elem_id="civit_load_more_btn", visible=True, elem_classes=["plugin-hidden-ui"])
-        self.browser_bridge_trigger = gr.Button(visible=False) 
+        self.browser_bridge_trigger = gr.Button(visible=False)
 
+        # Drop saved selections that CivitAI no longer offers (avoids invalid dropdown values).
         d_sort = self.saved_settings.get("sort", "Highest Rated")
-        d_period = self.saved_settings.get("period", "Week")
+        if d_sort not in SORT_OPTIONS: d_sort = "Highest Rated"
+        d_period = self.saved_settings.get("period", "AllTime")
+        if d_period not in PERIOD_OPTIONS: d_period = "AllTime"
         d_nsfw = self.saved_settings.get("nsfw", True)
-        d_types = self.saved_settings.get("types", ["Checkpoint", "LORA"])
-        d_base = self.saved_settings.get("base", DEFAULT_BASE_SELECTION)
+        d_types = [t for t in self.saved_settings.get("types", ["Checkpoint", "LORA"]) if t in self.civit_model_types]
+        d_base = [b for b in self.saved_settings.get("base", DEFAULT_BASE_SELECTION) if b in self.civit_base_models]
+        d_page_size = self.saved_settings.get("page_size", 20)
+        if d_page_size not in PAGE_SIZE_OPTIONS: d_page_size = 20
 
         with gr.Tabs() as self.civit_tabs:
             with gr.Tab("Browse", id="browse_tab"):
                 with gr.Row():
                     with gr.Column(scale=1, min_width=250):
-                        self.query = gr.Textbox(label="Search", placeholder="Search models...")
+                        self.query = gr.Textbox(
+                            label="Search",
+                            placeholder="Name or keywords, @username, model ID or CivitAI URL",
+                            info="Press Enter to search. Leave empty to browse."
+                        )
                         with gr.Accordion("Filters", open=True):
-                            self.sort = gr.Dropdown(SORT_OPTIONS, value=d_sort, label="Sort")
-                            self.period = gr.Dropdown(PERIOD_OPTIONS, value=d_period, label="Period")
+                            self.sort = gr.Dropdown(SORT_OPTIONS, value=d_sort, label="Sort",
+                                                    info="'Relevance' ranks text searches by match quality.")
+                            self.period = gr.Dropdown(PERIOD_OPTIONS, value=d_period, label="Period",
+                                                      info="Time window for browsing. Ignored for text searches.")
                             self.nsfw = gr.Checkbox(label="NSFW", value=d_nsfw)
-                            self.types = gr.Dropdown(MODEL_TYPES, value=d_types, multiselect=True, label="Types")
-                            self.base = gr.Dropdown(BASE_MODELS, value=d_base, multiselect=True, label="Base Models")
+                            self.types = gr.Dropdown(self.civit_model_types, value=d_types, multiselect=True,
+                                                     filterable=True, label="Types")
+                            self.base_search = gr.Textbox(
+                                label="Find Base Models",
+                                placeholder="e.g. wan 2.2, flux, ltx, qwen",
+                                info=f"{len(self.civit_base_models)} base models from {self.enums_source}. Words can be in any order."
+                            )
+                            with gr.Row():
+                                self.base_add_matches = gr.Button("➕ Select all matches", size="sm")
+                                self.base_clear = gr.Button("✖ Clear selection", size="sm")
+                            self.base = gr.Dropdown(self.civit_base_models, value=d_base, multiselect=True,
+                                                    filterable=True, label="Base Models",
+                                                    info="Leave empty for all base models.")
+                            self.page_size = gr.Dropdown(PAGE_SIZE_OPTIONS, value=d_page_size, label="Results per page")
                         self.search_btn = gr.Button("Search / Browse", variant="primary")
                         self.status = gr.Markdown("Ready")
                     with gr.Column(scale=3):
+                        pager_top = self._build_pager("civit_pager_top")
                         self.html_results = gr.HTML()
+                        pager_bottom = self._build_pager("civit_pager_bottom")
+                self.pager_outputs = list(pager_top) + list(pager_bottom)
 
             with gr.Tab("Details", id="details_tab"):
                 self.back_btn = gr.Button("← Back to Browse")
@@ -594,21 +659,66 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
         self.manager_to_browser_btn.click(self.bridge_manager_to_browser, inputs=[self.manager_to_browser_state], outputs=[self.main_tabs, self.bridge_input, self.browser_bridge_trigger])
 
-        def save_browser_settings(sort, period, nsfw, types, base):
-            self.save_settings_to_disk(sort=sort, period=period, nsfw=nsfw, types=types, base=base)
-        
-        save_inputs = [self.sort, self.period, self.nsfw, self.types, self.base]
+        def save_browser_settings(sort, period, nsfw, types, base, page_size):
+            self.save_settings_to_disk(sort=sort, period=period, nsfw=nsfw, types=types, base=base, page_size=page_size)
+
+        save_inputs = [self.sort, self.period, self.nsfw, self.types, self.base, self.page_size]
         for comp in save_inputs:
             comp.change(save_browser_settings, inputs=save_inputs, outputs=None)
 
-        self.search_btn.click(self.run_search, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key], [self.html_results, self.civit_items, self.civit_cursor, self.status])
-        self.load_more_btn.click(self.run_more, [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.api_key, self.civit_cursor, self.civit_items], [self.html_results, self.civit_items, self.civit_cursor, self.status])
+        # Base model finder: narrows the dropdown to matches (selected models always stay listed).
+        self.base_search.change(self.filter_base_choices, [self.base_search, self.base], [self.base])
+        self.base_add_matches.click(self.select_base_matches, [self.base_search, self.base], [self.base])
+        self.base_clear.click(self.filter_base_choices, [self.base_search, gr.State([])], [self.base])
+
+        # Period has no effect on text search, so grey it out while a query is typed.
+        self.query.change(lambda q: gr.update(interactive=not (q or "").strip()), [self.query], [self.period])
+
+        search_inputs = [self.query, self.sort, self.period, self.types, self.base, self.nsfw, self.page_size, self.api_key]
+        page_outputs = [self.html_results, self.civit_items, self.civit_nav, self.status] + self.pager_outputs
+        scroll_js = "() => { const el = document.getElementById('civit_pager_top'); if (el) el.scrollIntoView({behavior: 'smooth', block: 'start'}); }"
+
+        self.search_btn.click(self.run_search, search_inputs, page_outputs)
+        self.query.submit(self.run_search, search_inputs, page_outputs)
+        for prev_btn, next_btn in ((pager_top[0], pager_top[2]), (pager_bottom[0], pager_bottom[2])):
+            prev_btn.click(self.prev_page, [self.civit_nav, self.api_key], page_outputs).then(fn=None, js=scroll_js)
+            next_btn.click(self.next_page, [self.civit_nav, self.api_key], page_outputs).then(fn=None, js=scroll_js)
+
         self.bridge_input.change(self.on_select_model, [self.bridge_input, self.civit_items, self.api_key], [self.civit_tabs, self.detail_header, self.ver_dd, self.civit_model_data, self.status, self.target_folder]).then(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
         self.ver_dd.change(self.update_version_files, [self.ver_dd, self.civit_model_data], [self.file_dd, self.media_area, self.target_folder])
 
         self.back_btn.click(lambda: gr.Tabs(selected="browse_tab"), None, self.civit_tabs)
         self.dl_btn.click(self.download_model, [self.file_dd, self.api_key, self.state, self.civit_model_data, self.target_folder], [self.dl_status])
-        self.search_btn.click()
+
+    def match_base_models(self, text):
+        """All base models containing every word of `text` (case-insensitive, any order)."""
+        words = (text or "").lower().split()
+        if not words: return list(self.civit_base_models)
+        return [b for b in self.civit_base_models if all(w in b.lower() for w in words)]
+
+    def filter_base_choices(self, text, selected):
+        selected = list(selected or [])
+        matches = set(self.match_base_models(text))
+        choices = [b for b in self.civit_base_models if b in matches or b in selected]
+        if (text or "").strip():
+            info = f"{len(matches)} match{'es' if len(matches) != 1 else ''} for “{text.strip()}” · {len(selected)} selected"
+        else:
+            info = "Leave empty for all base models."
+        return gr.update(choices=choices, value=selected, info=info)
+
+    def select_base_matches(self, text, selected):
+        if not (text or "").strip():
+            gr.Warning("Type something in 'Find Base Models' first.")
+            return gr.update()
+        merged = list(dict.fromkeys(list(selected or []) + self.match_base_models(text)))
+        return self.filter_base_choices(text, merged)
+
+    def _build_pager(self, elem_id):
+        with gr.Row(elem_id=elem_id, equal_height=True):
+            prev_btn = gr.Button("◀ Prev", size="sm", interactive=False, scale=0, min_width=90)
+            label = gr.Markdown("")
+            next_btn = gr.Button("Next ▶", size="sm", interactive=False, scale=0, min_width=90)
+        return prev_btn, label, next_btn
 
     def render_lora_grid(self, state, category, selected_list):
         self.lora_root = self.discover_lora_root(state)
@@ -686,51 +796,132 @@ class LoraManagerPlugin(WAN2GPPlugin):
             except: pass
         return True, gr.update(choices=choices, value=val), self.render_lora_grid(state, val, selected_list or [])
 
-    def run_search(self, q, s, p, t, b, n, k):
-        items, nxt, msg = self.router_search(q, s, p, t, b, n, k, None)
-        self.items_cache = items 
-        html = self.render_html_grid(items)
-        return html, items, nxt, msg
+    # ---------- CivitAI search & pagination ----------
+    #
+    # Everything goes through the public REST API (/api/v1/models), which supports
+    # query + types + baseModels + nsfw + sort together. Pages are cursor-based:
+    # nav["cursors"][i] is the cursor that loads page i (page 0 = None), so Prev/Next
+    # can move freely without re-running the whole search.
 
-    def run_more(self, q, s, p, t, b, n, k, cur, existing):
-        if not cur: return gr.update(), existing, cur, "No more pages"
-        new_items, nxt, msg = self.router_search(q, s, p, t, b, n, k, cur)
-        combined = existing + new_items
-        self.items_cache = combined
-        html = self.render_html_grid(combined)
-        return html, combined, nxt, msg
+    @staticmethod
+    def parse_model_ref(query):
+        """Return a model ID if the query is a bare ID or a civitai.com/models/<id> URL."""
+        q = (query or "").strip()
+        if q.isdigit(): return int(q)
+        m = re.search(r"civitai\.(?:com|green)/models/(\d+)", q)
+        return int(m.group(1)) if m else None
 
-    def router_search(self, query, sort, period, types, base, nsfw, key, cursor):
-        if query and query.strip(): return self.search_rest(query, sort, period, nsfw, key, cursor)
-        else: return self.browse_trpc(sort, period, types, base, nsfw, key, cursor)
+    def build_search_params(self, query, sort, period, types, base, nsfw, page_size):
+        q = (query or "").strip()
+        params = {"limit": int(page_size or 20), "nsfw": "true" if nsfw else "false"}
+        if types: params["types"] = list(types)
+        if base: params["baseModels"] = list(base)
 
-    def search_rest(self, query, sort, period, nsfw, key, cursor):
-        params = {"query": query, "limit": 20, "sort": sort, "period": period, "nsfw": "true" if nsfw else "false"}
-        if cursor: params["cursor"] = cursor
-        try:
-            r = requests.get(REST_URL, headers=self.get_headers(key), params=params)
+        if q.startswith("@") and len(q) > 1:
+            params["username"] = q[1:].strip()
+        elif q:
+            params["query"] = q
+
+        if "query" in params:
+            # Text search: period is not applied (CivitAI returns empty/odd pages when combined).
+            if sort and sort != "Relevance": params["sort"] = sort
+        else:
+            params["sort"] = sort if sort and sort != "Relevance" else "Highest Rated"
+            params["period"] = period or "AllTime"
+        return params
+
+    def fetch_page(self, params, cursor, key):
+        """Fetch one page. Returns (items, next_cursor). Skips a few empty-but-continuing pages."""
+        for _ in range(3):
+            p = dict(params)
+            if cursor: p["cursor"] = cursor
+            r = requests.get(REST_URL, headers=self.get_headers(key), params=p, timeout=30)
             r.raise_for_status()
             data = r.json()
-            items = data.get("items", [])
-            meta = data.get("metadata", {})
-            next_cursor = meta.get("nextCursor") 
-            if not next_cursor and meta.get("nextPage") and "cursor=" in meta["nextPage"]:
-                try: next_cursor = meta["nextPage"].split("cursor=")[1].split("&")[0]
-                except: pass
-            return items, next_cursor, f"Search: {len(items)} results"
-        except Exception as e: return [], None, f"Error: {e}"
+            items = data.get("items", []) or []
+            meta = data.get("metadata", {}) or {}
+            nxt = meta.get("nextCursor")
+            if nxt is None and meta.get("nextPage"):
+                nxt = (parse_qs(urlparse(meta["nextPage"]).query).get("cursor") or [None])[0]
+            if items or not nxt or str(nxt) == str(cursor):
+                return items, (nxt if items else None)
+            cursor = nxt
+        return [], None
 
-    def browse_trpc(self, sort, period, types, base_models, nsfw, key, cursor):
-        input_obj = {"json": {"period": period, "periodMode": "published", "sort": sort, "types": types if types else MODEL_TYPES, "baseModels": base_models if base_models else [], "browsingLevel": 31 if nsfw else 1, "cursor": cursor, "authed": bool(key)}, "meta": {"values": {"cursor": ["undefined"]}}}
+    def _pager_updates(self, nav, count):
+        page = nav.get("page", 0)
+        has_prev = page > 0
+        has_next = bool(nav.get("has_next"))
+        if count:
+            size = nav.get("params", {}).get("limit", count)
+            start = page * size + 1
+            label = f"<div style='text-align:center'>Page <b>{page + 1}</b> · results {start}–{start + count - 1}{'' if has_next else ' (last page)'}</div>"
+        else:
+            label = ""
+        one = [gr.update(interactive=has_prev), label, gr.update(interactive=has_next)]
+        return one + one
+
+    def _page_result(self, nav, items, status):
+        hide_nsfw = nav.get("params", {}).get("nsfw") == "false"
+        return [self.render_html_grid(items, hide_nsfw), items, nav, status] + self._pager_updates(nav, len(items))
+
+    def _load_page(self, nav, page, key):
+        """Load page index `page` of the search described by nav. On error keep the old page."""
+        cursors = list(nav.get("cursors", [None]))
+        if page < 0 or page >= len(cursors):
+            return [gr.update(), gr.update(), nav, gr.update()] + [gr.update()] * 6
         try:
-            r = requests.get(TRPC_URL, headers=self.get_headers(key), params={"input": json.dumps(input_obj)})
-            r.raise_for_status()
-            data = r.json()
-            json_data = data.get("result", {}).get("data", {}).get("json", {})
-            return json_data.get("items", []), json_data.get("nextCursor"), f"Browse: {len(json_data.get('items', []))} items"
-        except Exception as e: return [], None, f"Error: {e}"
+            items, nxt = self.fetch_page(nav["params"], cursors[page], key)
+        except Exception as e:
+            print(f"[LoRA Manager] CivitAI request failed: {e}")
+            return [gr.update(), gr.update(), nav, f"⚠️ CivitAI request failed: {e}"] + [gr.update()] * 6
 
-    def render_html_grid(self, items):
+        cursors = cursors[:page + 1]
+        if nxt: cursors.append(nxt)
+        new_nav = dict(nav, cursors=cursors, page=page, has_next=bool(nxt))
+        if not items:
+            status = "No models found. Try removing some filters." if page == 0 else "No more results."
+        else:
+            status = f"{nav.get('label', 'Results')} · page {page + 1}"
+        return self._page_result(new_nav, items, status)
+
+    def run_search(self, query, sort, period, types, base, nsfw, page_size, key):
+        mid = self.parse_model_ref(query)
+        if mid:
+            nav = {"params": {"nsfw": "true"}, "cursors": [None], "page": 0, "has_next": False}
+            try:
+                r = requests.get(f"{REST_URL}/{mid}", headers=self.get_headers(key), timeout=30)
+                r.raise_for_status()
+                return self._page_result(nav, [r.json()], f"Model #{mid}")
+            except Exception as e:
+                return self._page_result(nav, [], f"⚠️ Model #{mid} not found: {e}")
+
+        params = self.build_search_params(query, sort, period, types, base, nsfw, page_size)
+        if "query" in params: label = f"Search “{params['query']}”"
+        elif "username" in params: label = f"Models by @{params['username']}"
+        else: label = f"Browse · {params['sort']} · {params['period']}"
+        nav = {"params": params, "cursors": [None], "page": 0, "has_next": False, "label": label}
+        return self._load_page(nav, 0, key)
+
+    def next_page(self, nav, key):
+        if not nav or not nav.get("has_next"):
+            return [gr.update(), gr.update(), nav, gr.update()] + [gr.update()] * 6
+        return self._load_page(nav, nav.get("page", 0) + 1, key)
+
+    def prev_page(self, nav, key):
+        if not nav or nav.get("page", 0) <= 0:
+            return [gr.update(), gr.update(), nav, gr.update()] + [gr.update()] * 6
+        return self._load_page(nav, nav["page"] - 1, key)
+
+    def thumb_url(self, url, is_video):
+        """Turn a CivitAI media URL into a ~450px thumbnail URL."""
+        if not url: return ""
+        if "http" not in url: return self.construct_media_url(url, THUMB_WIDTH, is_video)
+        if "/original=true/" in url:
+            return url.replace("/original=true/", f"/width={THUMB_WIDTH}/")
+        return url
+
+    def render_html_grid(self, items, hide_nsfw=False):
         if not items:
             return "<div style='color:#888; padding:20px; text-align:center; font-size:1.2em;'>No models found.</div>"
 
@@ -738,34 +929,28 @@ class LoraManagerPlugin(WAN2GPPlugin):
 
         for item in items:
             mid = item.get('id')
-            name = item.get('name', 'Unknown').replace('"', '&quot;')
-            rank = item.get('rank', {}) or {}
+            if not isinstance(mid, int): continue
+            name = html_lib.escape(item.get('name') or 'Unknown')
             stats = item.get('stats', {}) or {}
-            thumbs = rank.get('thumbsUpCount', stats.get('favoriteCount', stats.get('thumbsUpCount', 0))) or 0
-            dls = rank.get('downloadCount', stats.get('downloadCount', 0)) or 0
+            thumbs = stats.get('thumbsUpCount', stats.get('favoriteCount', 0)) or 0
+            dls = stats.get('downloadCount', 0) or 0
             dls_str = f"{dls/1000:.1f}k" if dls > 1000 else str(dls)
-            mtype = item.get('type', 'Model')
+            mtype = html_lib.escape(item.get('type') or 'Model')
             media_html = ""
-            poster_src = ""
             imgs = item.get('images', [])
-            if not imgs and 'version' in item: imgs = item['version'].get('images', [])
             if not imgs and 'modelVersions' in item and item['modelVersions']: imgs = item['modelVersions'][0].get('images', [])
+            imgs = [i for i in (imgs or []) if i.get('url')]
+            if hide_nsfw:
+                imgs = [i for i in imgs if (i.get('nsfwLevel') or 1) <= 1 and i.get('nsfw') in (None, False, "None")]
 
             if imgs:
                 first = imgs[0]
                 url = first.get('url')
-                is_vid = first.get('type') == 'video' or (url and (url.endswith('.mp4') or url.endswith('.webm')))
-                src = ""
-                if url:
-                    if "http" not in url:
-                        src = self.construct_media_url(url, 450, is_vid)
-                        if is_vid: poster_src = self.construct_media_url(url, 450, False)
-                    else:
-                        src = url
-                        if is_vid: poster_src = src.replace('.mp4', '.jpg').replace('.webm', '.jpg')
+                is_vid = first.get('type') == 'video' or url.endswith(('.mp4', '.webm'))
+                src = html_lib.escape(self.thumb_url(url, is_vid), quote=True)
 
                 if is_vid:
-                    media_html = f'<video class="civit-media" src="{src}" poster="{poster_src}" autoplay loop muted playsinline preload="auto"></video>'
+                    media_html = f'<video class="civit-media" src="{src}" autoplay loop muted playsinline preload="metadata"></video>'
                 else:
                     _, local_url = self.get_local_preview_path(mid)
                     if local_url: media_html = f'<img class="civit-media" src="{local_url}" loading="lazy" alt="preview">'
